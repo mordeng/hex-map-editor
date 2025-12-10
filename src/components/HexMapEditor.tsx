@@ -129,7 +129,11 @@ export default function HexMapEditor() {
   useEffect(() => {
     fetch(`${process.env.NODE_ENV === 'production' ? '/hex-map-editor' : ''}/bordered_map.json`)
       .then(res => res.json())
-      .then((parsed: MapData) => setData(parsed))
+      .then((parsed: MapData) => {
+        setData(parsed);
+        setSpawnPoints(parsed.spawnPoints ?? []);
+        setWorldTree(parsed.worldTree ?? null);
+      })
       .catch(err => console.error('Failed to load default map:', err));
   }, []);
 
@@ -644,7 +648,7 @@ export default function HexMapEditor() {
           <div className="space-y-1">
             <div className="flex items-center gap-2">
               <span className="w-4 h-4 flex items-center justify-center text-xs font-bold bg-white border border-gray-300 rounded">0</span>
-              <span className="text-xs text-gray-600">Walkable / Road</span>
+              <span className="text-xs text-gray-600">Walkable / Road (not buildable)</span>
             </div>
             <div className="flex items-center gap-2">
               <span className="w-4 h-4 flex items-center justify-center text-xs font-bold bg-white border border-gray-300 rounded">1</span>
