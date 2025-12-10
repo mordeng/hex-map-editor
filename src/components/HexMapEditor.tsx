@@ -105,9 +105,9 @@ export default function HexMapEditor() {
   const [data, setData] = useState<MapData | null>(null);
   const [selected, setSelected] = useState<Hex | null>(null);
   const [selectedMultiple, setSelectedMultiple] = useState<Set<string>>(new Set());
-  const [rect, setRect] = useState(true);
-  const [stagger, setStagger] = useState(true);
-  const [mirror, setMirror] = useState(true);
+  const [rect] = useState(true);
+  const [stagger] = useState(true);
+  const [mirror] = useState(true);
 
   // Edit mode, spawn points, and world tree
   const [editMode, setEditMode] = useState<EditMode>('terrain');
