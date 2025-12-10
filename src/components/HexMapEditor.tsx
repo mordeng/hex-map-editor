@@ -125,6 +125,14 @@ export default function HexMapEditor() {
   const lastFileHandle = useRef<FileSystemFileHandle | null>(null);
   const lastFileName = useRef<string>('map.json');
 
+  // Load default map on mount
+  useEffect(() => {
+    fetch(`${process.env.NODE_ENV === 'production' ? '/hex-map-editor' : ''}/bordered_map.json`)
+      .then(res => res.json())
+      .then((parsed: MapData) => setData(parsed))
+      .catch(err => console.error('Failed to load default map:', err));
+  }, []);
+
   // File IO - use File System Access API for import to get file handle
   const handleImportClick = useCallback(async () => {
     // Try File System Access API first to get file handle
@@ -604,6 +612,56 @@ export default function HexMapEditor() {
           </div>
         )}
         <Input ref={fileRef} type="file" accept="application/json" className="hidden" onChange={handleImport} />
+
+        {/* Legend */}
+        <div className="mt-4 p-3 bg-gray-50 border border-gray-200 rounded-lg">
+          <h3 className="text-sm font-medium text-gray-700 mb-2">Terrain</h3>
+          <div className="grid grid-cols-2 gap-1.5">
+            {Object.entries(TERRAIN_COLOURS).map(([name, color]) => (
+              <div key={name} className="flex items-center gap-2">
+                <div
+                  className="w-4 h-4 rounded border border-gray-300"
+                  style={{ backgroundColor: color }}
+                />
+                <span className="text-xs text-gray-600 capitalize">{name}</span>
+              </div>
+            ))}
+          </div>
+
+          <h3 className="text-sm font-medium text-gray-700 mt-3 mb-2">Markers</h3>
+          <div className="grid grid-cols-2 gap-1.5">
+            <div className="flex items-center gap-2">
+              <div className="w-4 h-4 rounded-full bg-red-500 border-2 border-red-700" />
+              <span className="text-xs text-gray-600">Spawn</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="w-4 h-4 rounded-full bg-green-500 border-2 border-green-700" />
+              <span className="text-xs text-gray-600">Goal</span>
+            </div>
+          </div>
+
+          <h3 className="text-sm font-medium text-gray-700 mt-3 mb-2">Tiers</h3>
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <span className="w-4 h-4 flex items-center justify-center text-xs font-bold bg-white border border-gray-300 rounded">0</span>
+              <span className="text-xs text-gray-600">Walkable / Road</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="w-4 h-4 flex items-center justify-center text-xs font-bold bg-white border border-gray-300 rounded">1</span>
+              <span className="text-xs text-gray-600">Normal wall</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="w-4 h-4 flex items-center justify-center text-xs font-bold bg-white border border-gray-300 rounded">2</span>
+              <span className="text-xs text-gray-600">Unmodifiable wall</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="w-4 h-4 flex items-center justify-center text-xs font-bold bg-white border border-gray-300 rounded">3</span>
+              <span className="text-xs text-gray-600">Out of bounds</span>
+            </div>
+          </div>
+
+          <p className="text-xs text-gray-400 mt-3 italic">Ctrl+click to multi-select</p>
+        </div>
 
         {/* Spawn mode info panel */}
         {editMode === 'spawn' && (
