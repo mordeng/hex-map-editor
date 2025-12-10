@@ -121,6 +121,9 @@ export default function HexMapEditor() {
   const isBrushPainting = useRef(false);
   const paintedInStroke = useRef<Set<string>>(new Set());
 
+  // Isometric 3D view
+  const [isometric, setIsometric] = useState(false);
+
   // pan & zoom
   const [scale, setScale] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
@@ -567,13 +570,28 @@ export default function HexMapEditor() {
               width="100%"
               height="100%"
               className="select-none cursor-grab"
+              style={isometric ? {
+                transform: 'perspective(1500px) rotateX(45deg)',
+                transformOrigin: 'center top',
+                marginTop: '100px',
+              } : undefined}
               onMouseDown={onMouseDown}
               onMouseMove={onMouseMove}
               onMouseUp={onMouseUp}
               onMouseLeave={onMouseUp}
             >
               <g transform={`translate(${offset.x + bounds.w / 2 * (1 - scale)} ${offset.y + bounds.h / 2 * (1 - scale)}) scale(${scale})`}>
-                {data.map.map(hex => {
+                {/* Sort hexes for proper z-ordering in isometric view */}
+                {[...data.map]
+                  .sort((a, b) => {
+                    if (!isometric) return 0;
+                    // Sort by row first (back to front), then by tier (lower tiers first)
+                    const rowDiff = a.r - b.r;
+                    if (rowDiff !== 0) return rowDiff;
+                    // Same row: lower tier renders first (appears behind)
+                    return a.tier - b.tier;
+                  })
+                  .map(hex => {
                   const { x, y } = axialToPixel(
                     hex.q,
                     hex.r,
@@ -588,8 +606,15 @@ export default function HexMapEditor() {
                   const isTree = isWorldTree(hex.q, hex.r);
                   const isSelected = selected?.id === hex.id;
                   const isMultiSelected = selectedMultiple.has(hex.id);
+                  // Vertical offset for isometric view based on tier
+                  const tierOffset = isometric ? -hex.tier * sizePx * 0.5 : 0;
                   return (
-                    <g key={hex.id} onClick={(e) => handleHexClick(hex, e)} className="cursor-pointer">
+                    <g
+                      key={hex.id}
+                      onClick={(e) => handleHexClick(hex, e)}
+                      className="cursor-pointer"
+                      transform={isometric ? `translate(0, ${tierOffset})` : undefined}
+                    >
                       <motion.polygon
                         points={hexPoints(x, y, sizePx, data.orientation)}
                         initial={{ scale: 0 }}
@@ -701,6 +726,15 @@ export default function HexMapEditor() {
             disabled={!data}
           >
             Reset View
+          </Button>
+          <Button
+            variant={isometric ? 'default' : 'outline'}
+            size="sm"
+            onClick={() => setIsometric(!isometric)}
+            disabled={!data}
+            className={isometric ? 'bg-purple-600 hover:bg-purple-700' : ''}
+          >
+            {isometric ? '3D' : '2D'}
           </Button>
         </div>
 
