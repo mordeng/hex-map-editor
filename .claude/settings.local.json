@@ -3,7 +3,8 @@
     "allow": [
       "Bash(npm run build:*)",
       "Bash(npx next build:*)",
-      "Bash(./node_modules/.bin/next build:*)"
+      "Bash(./node_modules/.bin/next build:*)",
+      "Bash(npm run dev:*)"
     ]
   }
 }

@@ -96,6 +96,61 @@ function shadeColour(hex: Hex, minH: number, maxH: number) {
   return `#${[mix(rB), mix(gB), mix(bB)].map(v => v.toString(16).padStart(2, '0')).join('')}`;
 }
 
+// Darken a hex color by a percentage (0-1)
+function darkenColor(color: string, amount: number): string {
+  const r = parseInt(color.slice(1, 3), 16);
+  const g = parseInt(color.slice(3, 5), 16);
+  const b = parseInt(color.slice(5, 7), 16);
+  const darken = (c: number) => Math.round(c * (1 - amount));
+  return `#${[darken(r), darken(g), darken(b)].map(v => v.toString(16).padStart(2, '0')).join('')}`;
+}
+
+// Get hex corner points as array of {x, y}
+function getHexCorners(cx: number, cy: number, size: number, orientation: Orientation): {x: number, y: number}[] {
+  const offsetDeg = orientation === 'pointy' ? 30 : 0;
+  return Array.from({ length: 6 }, (_, i) => {
+    const ang = ((offsetDeg + 60 * i) * Math.PI) / 180;
+    return { x: cx + size * Math.cos(ang), y: cy + size * Math.sin(ang) };
+  });
+}
+
+// Get wall polygons for a hex (visible sides based on isometric view)
+function getHexWalls(
+  cx: number,
+  cy: number,
+  size: number,
+  orientation: Orientation,
+  tierHeight: number
+): { points: string; shade: number }[] {
+  const corners = getHexCorners(cx, cy, size, orientation);
+  const walls: { points: string; shade: number }[] = [];
+
+  // For pointy-top hex, draw bottom 3 walls (indices 2-3, 3-4, 4-5)
+  // These are the walls visible from front when elevated hexes go up/backward
+  const visibleEdges = orientation === 'pointy' ? [2, 3, 4] : [2, 3, 4];
+
+  visibleEdges.forEach((startIdx, i) => {
+    const endIdx = (startIdx + 1) % 6;
+    const baseCorner1 = corners[startIdx];
+    const baseCorner2 = corners[endIdx];
+    // Top of wall is elevated (negative Y = up/backward in tilted view)
+    const top1 = { x: baseCorner1.x, y: baseCorner1.y - tierHeight };
+    const top2 = { x: baseCorner2.x, y: baseCorner2.y - tierHeight };
+    // Bottom of wall is at base level
+    const bot1 = baseCorner1;
+    const bot2 = baseCorner2;
+
+    // Shade varies by wall angle (left darker, center medium, right lighter)
+    const shades = [0.5, 0.4, 0.45];
+    walls.push({
+      points: `${top1.x},${top1.y} ${top2.x},${top2.y} ${bot2.x},${bot2.y} ${bot1.x},${bot1.y}`,
+      shade: shades[i],
+    });
+  });
+
+  return walls;
+}
+
 // --------------------------------------------------------------------------
 // MAIN COMPONENT
 // --------------------------------------------------------------------------
@@ -123,6 +178,7 @@ export default function HexMapEditor() {
 
   // Isometric 3D view
   const [isometric, setIsometric] = useState(false);
+  const [tiltAngle, setTiltAngle] = useState(45);
 
   // pan & zoom
   const [scale, setScale] = useState(1);
@@ -138,7 +194,8 @@ export default function HexMapEditor() {
 
   // Load default map on mount
   useEffect(() => {
-    fetch(`${process.env.NODE_ENV === 'production' ? '/hex-map-editor' : ''}/bordered_map.json`)
+    // Always use basePath since it's configured in next.config.ts
+    fetch('/hex-map-editor/bordered_map.json')
       .then(res => res.json())
       .then((parsed: MapData) => {
         setData(parsed);
@@ -571,7 +628,7 @@ export default function HexMapEditor() {
               height="100%"
               className="select-none cursor-grab"
               style={isometric ? {
-                transform: 'perspective(1500px) rotateX(45deg)',
+                transform: `perspective(1500px) rotateX(${tiltAngle}deg)`,
                 transformOrigin: 'center top',
                 marginTop: '100px',
               } : undefined}
@@ -585,11 +642,14 @@ export default function HexMapEditor() {
                 {[...data.map]
                   .sort((a, b) => {
                     if (!isometric) return 0;
-                    // Sort by row first (back to front), then by tier (lower tiers first)
-                    const rowDiff = a.r - b.r;
-                    if (rowDiff !== 0) return rowDiff;
-                    // Same row: lower tier renders first (appears behind)
-                    return a.tier - b.tier;
+                    // Sort by effective visual position (row adjusted for tier height)
+                    // Higher tier hexes move backward (up), so subtract tier contribution
+                    // This ensures proper layering: back hexes render first, elevated hexes
+                    // render in their visual position rather than logical row
+                    const tierFactor = 0.5; // matches tierHeight / sizePx
+                    const aEffective = a.r - a.tier * tierFactor;
+                    const bEffective = b.r - b.tier * tierFactor;
+                    return aEffective - bEffective;
                   })
                   .map(hex => {
                   const { x, y } = axialToPixel(
@@ -606,28 +666,43 @@ export default function HexMapEditor() {
                   const isTree = isWorldTree(hex.q, hex.r);
                   const isSelected = selected?.id === hex.id;
                   const isMultiSelected = selectedMultiple.has(hex.id);
-                  // Vertical offset for isometric view based on tier
-                  const tierOffset = isometric ? -hex.tier * sizePx * 0.5 : 0;
+                  // Vertical offset for isometric view based on tier (negative Y = up/backward in tilted view)
+                  const tierHeight = sizePx * 0.5;
+                  const tierOffset = isometric ? -hex.tier * tierHeight : 0;
+                  const hexColor = shadeColour(hex, minH, maxH);
+                  const walls = isometric && hex.tier > 0 ? getHexWalls(x, y, sizePx, data.orientation, hex.tier * tierHeight) : [];
                   return (
                     <g
                       key={hex.id}
                       onClick={(e) => handleHexClick(hex, e)}
                       className="cursor-pointer"
-                      transform={isometric ? `translate(0, ${tierOffset})` : undefined}
                     >
-                      <motion.polygon
-                        points={hexPoints(x, y, sizePx, data.orientation)}
-                        initial={{ scale: 0 }}
-                        animate={{ scale: 1 }}
-                        transition={{ type: 'spring', stiffness: 120 }}
-                        stroke={isTree ? '#22c55e' : isSpawn ? '#ff4444' : isMultiSelected ? '#3b82f6' : '#333'}
-                        strokeWidth={isTree ? 4 : isSpawn ? 4 : isMultiSelected ? 3 : 1.2}
-                        fill={shadeColour(hex, minH, maxH)}
-                        opacity={isSelected || isMultiSelected ? 0.7 : 1}
-                      />
+                      {/* Walls for raised hexes - rendered at base, connecting to elevated top */}
+                      {walls.map((wall, i) => (
+                        <polygon
+                          key={`wall-${i}`}
+                          points={wall.points}
+                          fill={darkenColor(hexColor, wall.shade)}
+                          stroke="#333"
+                          strokeWidth={0.5}
+                        />
+                      ))}
+                      {/* Top face */}
+                      <g transform={`translate(0, ${tierOffset})`}>
+                        <motion.polygon
+                          points={hexPoints(x, y, sizePx, data.orientation)}
+                          initial={{ scale: 0 }}
+                          animate={{ scale: 1 }}
+                          transition={{ type: 'spring', stiffness: 120 }}
+                          stroke={isTree ? '#22c55e' : isSpawn ? '#ff4444' : isMultiSelected ? '#3b82f6' : '#333'}
+                          strokeWidth={isTree ? 4 : isSpawn ? 4 : isMultiSelected ? 3 : 1.2}
+                          fill={hexColor}
+                          opacity={isSelected || isMultiSelected ? 0.7 : 1}
+                        />
+                      </g>
                       {/* World tree marker */}
                       {isTree && (
-                        <g>
+                        <g transform={`translate(0, ${tierOffset})`}>
                           <circle
                             cx={x}
                             cy={y}
@@ -650,7 +725,7 @@ export default function HexMapEditor() {
                       )}
                       {/* Spawn point marker */}
                       {isSpawn && (
-                        <g>
+                        <g transform={`translate(0, ${tierOffset})`}>
                           <circle
                             cx={x}
                             cy={y}
@@ -737,6 +812,22 @@ export default function HexMapEditor() {
             {isometric ? '3D' : '2D'}
           </Button>
         </div>
+
+        {/* Tilt Angle Slider (only when 3D is enabled) */}
+        {isometric && data && (
+          <div className="flex items-center gap-2 mt-2">
+            <span className="text-xs text-gray-500">Tilt:</span>
+            <input
+              type="range"
+              min="20"
+              max="70"
+              value={tiltAngle}
+              onChange={(e) => setTiltAngle(Number(e.target.value))}
+              className="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+            />
+            <span className="text-xs text-gray-500 min-w-[30px]">{tiltAngle}°</span>
+          </div>
+        )}
 
         {/* Edit Mode Toggle */}
         {data && (
