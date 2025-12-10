@@ -114,10 +114,17 @@ export default function HexMapEditor() {
   const [spawnPoints, setSpawnPoints] = useState<SpawnPoint[]>([]);
   const [worldTree, setWorldTree] = useState<{ q: number; r: number } | null>(null);
 
+  // Brush tool
+  const [brushEnabled, setBrushEnabled] = useState(false);
+  const [brushTerrain, setBrushTerrain] = useState<string>('grass');
+  const [brushTier, setBrushTier] = useState<number>(0);
+  const isBrushPainting = useRef(false);
+
   // pan & zoom
   const [scale, setScale] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const isPanning = useRef(false);
+  const isDragSelecting = useRef(false);
   const start = useRef({ x: 0, y: 0 });
 
   const fileRef = useRef<HTMLInputElement | null>(null);
@@ -420,21 +427,122 @@ export default function HexMapEditor() {
     return [Math.min(...hs), Math.max(...hs)];
   }, [data]);
 
+  // Find hex at SVG coordinates
+  const findHexAtPoint = useCallback((svgX: number, svgY: number): Hex | null => {
+    if (!data) return null;
+    // Check each hex and find the closest one within range
+    let closest: Hex | null = null;
+    let closestDist = Infinity;
+    const threshold = sizePx * 0.9; // Slightly smaller than hex size for better accuracy
+
+    for (const hex of data.map) {
+      const { x, y } = axialToPixel(hex.q, hex.r, sizePx, data.orientation, rect, stagger, mirror, maxR);
+      const dist = Math.sqrt((svgX - x) ** 2 + (svgY - y) ** 2);
+      if (dist < threshold && dist < closestDist) {
+        closest = hex;
+        closestDist = dist;
+      }
+    }
+    return closest;
+  }, [data, sizePx, rect, stagger, mirror, maxR]);
+
+  // Convert mouse event to SVG coordinates
+  const mouseToSvg = useCallback((e: React.MouseEvent<SVGSVGElement>): { x: number; y: number } | null => {
+    const svg = svgRef.current;
+    if (!svg) return null;
+    const svgRect = svg.getBoundingClientRect();
+    const viewBox = svg.viewBox.baseVal;
+    const scaleX = viewBox.width / svgRect.width;
+    const scaleY = viewBox.height / svgRect.height;
+    return {
+      x: (e.clientX - svgRect.left) * scaleX,
+      y: (e.clientY - svgRect.top) * scaleY,
+    };
+  }, []);
+
+  // Paint hex with brush
+  const paintHexWithBrush = useCallback((hex: Hex) => {
+    if (!data) return;
+    setData(prev => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        map: prev.map.map(h =>
+          h.id === hex.id ? { ...h, terrain: brushTerrain, tier: brushTier } : h
+        ),
+      };
+    });
+  }, [data, brushTerrain, brushTier]);
+
   // Handlers -------------------------------------------------------------
   const onMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
     if (e.button !== 0) return;
-    isPanning.current = true;
-    start.current = { x: e.clientX - offset.x, y: e.clientY - offset.y };
+
+    if (brushEnabled && editMode === 'terrain') {
+      // Start brush painting
+      isBrushPainting.current = true;
+      isPanning.current = false;
+      isDragSelecting.current = false;
+      // Paint the hex under cursor immediately
+      const svgPoint = mouseToSvg(e);
+      if (svgPoint) {
+        const hex = findHexAtPoint(svgPoint.x, svgPoint.y);
+        if (hex) paintHexWithBrush(hex);
+      }
+    } else if ((e.ctrlKey || e.metaKey) && editMode === 'terrain') {
+      // Start drag-select mode
+      isDragSelecting.current = true;
+      isPanning.current = false;
+      isBrushPainting.current = false;
+    } else {
+      // Normal pan
+      isPanning.current = true;
+      isDragSelecting.current = false;
+      isBrushPainting.current = false;
+      start.current = { x: e.clientX - offset.x, y: e.clientY - offset.y };
+    }
   };
+
   const onMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    // Brush painting
+    if (isBrushPainting.current && brushEnabled) {
+      const svgPoint = mouseToSvg(e);
+      if (svgPoint) {
+        const hex = findHexAtPoint(svgPoint.x, svgPoint.y);
+        if (hex) paintHexWithBrush(hex);
+      }
+      return;
+    }
+
+    // Drag select
+    if (isDragSelecting.current && (e.ctrlKey || e.metaKey)) {
+      const svgPoint = mouseToSvg(e);
+      if (svgPoint) {
+        const hex = findHexAtPoint(svgPoint.x, svgPoint.y);
+        if (hex) {
+          setSelectedMultiple(prev => {
+            if (prev.has(hex.id)) return prev;
+            const newSet = new Set(prev);
+            newSet.add(hex.id);
+            return newSet;
+          });
+          setSelected(hex);
+        }
+      }
+      return;
+    }
+
     if (!isPanning.current) return;
     setOffset({
       x: e.clientX - start.current.x,
       y: e.clientY - start.current.y,
     });
   };
+
   const onMouseUp = () => {
     isPanning.current = false;
+    isDragSelecting.current = false;
+    isBrushPainting.current = false;
   };
 
   // JSX
@@ -615,6 +723,66 @@ export default function HexMapEditor() {
             </Button>
           </div>
         )}
+
+        {/* Brush Tool */}
+        {data && editMode === 'terrain' && (
+          <div className="mt-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="text-sm font-medium text-blue-700">Brush Tool</h3>
+              <Button
+                size="sm"
+                variant={brushEnabled ? 'default' : 'outline'}
+                onClick={() => setBrushEnabled(!brushEnabled)}
+                className={brushEnabled ? 'bg-blue-600 hover:bg-blue-700' : ''}
+              >
+                {brushEnabled ? '🖌️ On' : '🖌️ Off'}
+              </Button>
+            </div>
+            {brushEnabled && (
+              <div className="space-y-2">
+                <div>
+                  <Label className="text-xs text-blue-600">Terrain</Label>
+                  <Select value={brushTerrain} onValueChange={setBrushTerrain}>
+                    <SelectTrigger className="h-8">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {Object.keys(TERRAIN_COLOURS).map(t => (
+                        <SelectItem key={t} value={t}>
+                          <div className="flex items-center gap-2">
+                            <div
+                              className="w-3 h-3 rounded"
+                              style={{ backgroundColor: TERRAIN_COLOURS[t] }}
+                            />
+                            {t}
+                          </div>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div>
+                  <Label className="text-xs text-blue-600">Tier</Label>
+                  <div className="flex items-center gap-2">
+                    {[0, 1, 2, 3].map(t => (
+                      <Button
+                        key={t}
+                        size="sm"
+                        variant={brushTier === t ? 'default' : 'outline'}
+                        onClick={() => setBrushTier(t)}
+                        className={`flex-1 ${brushTier === t ? 'bg-blue-600' : ''}`}
+                      >
+                        {t}
+                      </Button>
+                    ))}
+                  </div>
+                </div>
+                <p className="text-xs text-blue-400 italic">Click and drag to paint</p>
+              </div>
+            )}
+          </div>
+        )}
+
         <Input ref={fileRef} type="file" accept="application/json" className="hidden" onChange={handleImport} />
 
         {/* Legend */}
@@ -664,7 +832,7 @@ export default function HexMapEditor() {
             </div>
           </div>
 
-          <p className="text-xs text-gray-400 mt-3 italic">Ctrl+click to multi-select</p>
+          <p className="text-xs text-gray-400 mt-3 italic">Ctrl+click or Ctrl+drag to multi-select</p>
         </div>
 
         {/* Spawn mode info panel */}
