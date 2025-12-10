@@ -119,6 +119,7 @@ export default function HexMapEditor() {
   const [brushTerrain, setBrushTerrain] = useState<string>('grass');
   const [brushTier, setBrushTier] = useState<number>(0);
   const isBrushPainting = useRef(false);
+  const paintedInStroke = useRef<Set<string>>(new Set());
 
   // pan & zoom
   const [scale, setScale] = useState(1);
@@ -460,9 +461,15 @@ export default function HexMapEditor() {
     };
   }, []);
 
-  // Paint hex with brush
+  // Paint hex with brush (skips already painted in this stroke)
   const paintHexWithBrush = useCallback((hex: Hex) => {
     if (!data) return;
+    // Skip if already painted in this stroke
+    if (paintedInStroke.current.has(hex.id)) return;
+    // Skip if hex already has same terrain and tier
+    if (hex.terrain === brushTerrain && hex.tier === brushTier) return;
+
+    paintedInStroke.current.add(hex.id);
     setData(prev => {
       if (!prev) return prev;
       return {
@@ -483,6 +490,7 @@ export default function HexMapEditor() {
       isBrushPainting.current = true;
       isPanning.current = false;
       isDragSelecting.current = false;
+      paintedInStroke.current.clear(); // Reset for new stroke
       // Paint the hex under cursor immediately
       const svgPoint = mouseToSvg(e);
       if (svgPoint) {
@@ -543,6 +551,7 @@ export default function HexMapEditor() {
     isPanning.current = false;
     isDragSelecting.current = false;
     isBrushPainting.current = false;
+    paintedInStroke.current.clear();
   };
 
   // JSX
