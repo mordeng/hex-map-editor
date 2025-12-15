@@ -32,12 +32,19 @@ export interface SpawnPoint {
   r: number;
 }
 
+export interface WorldTree {
+  q: number;
+  r: number;
+  treeId: number;
+}
+
 export interface MapData {
   hexSize: number;
   orientation: Orientation;
   map: Hex[];
   spawnPoints?: SpawnPoint[];
-  worldTree?: { q: number; r: number };
+  worldTree?: { q: number; r: number }; // Legacy single tree (backward compatibility)
+  worldTrees?: WorldTree[]; // Multiple trees for multi-lane mode
 }
 
 const TERRAIN_COLOURS: Record<string, string> = {
@@ -164,10 +171,10 @@ export default function HexMapEditor() {
   const [stagger] = useState(true);
   const [mirror] = useState(true);
 
-  // Edit mode, spawn points, and world tree
+  // Edit mode, spawn points, and world trees
   const [editMode, setEditMode] = useState<EditMode>('terrain');
   const [spawnPoints, setSpawnPoints] = useState<SpawnPoint[]>([]);
-  const [worldTree, setWorldTree] = useState<{ q: number; r: number } | null>(null);
+  const [worldTrees, setWorldTrees] = useState<WorldTree[]>([]);
 
   // Brush tool
   const [brushEnabled, setBrushEnabled] = useState(false);
@@ -192,6 +199,19 @@ export default function HexMapEditor() {
   const lastFileHandle = useRef<FileSystemFileHandle | null>(null);
   const lastFileName = useRef<string>('map.json');
 
+  // Helper to load world trees from map data (handles both legacy and new format)
+  const loadWorldTrees = (parsed: MapData): WorldTree[] => {
+    // Priority 1: worldTrees array (multi-lane mode)
+    if (parsed.worldTrees && parsed.worldTrees.length > 0) {
+      return parsed.worldTrees;
+    }
+    // Priority 2: Legacy single worldTree
+    if (parsed.worldTree) {
+      return [{ q: parsed.worldTree.q, r: parsed.worldTree.r, treeId: 0 }];
+    }
+    return [];
+  };
+
   // Load default map on mount
   useEffect(() => {
     // Always use basePath since it's configured in next.config.ts
@@ -200,7 +220,7 @@ export default function HexMapEditor() {
       .then((parsed: MapData) => {
         setData(parsed);
         setSpawnPoints(parsed.spawnPoints ?? []);
-        setWorldTree(parsed.worldTree ?? null);
+        setWorldTrees(loadWorldTrees(parsed));
       })
       .catch(err => console.error('Failed to load default map:', err));
   }, []);
@@ -228,7 +248,7 @@ export default function HexMapEditor() {
         const parsed = JSON.parse(text) as MapData;
         setData(parsed);
         setSpawnPoints(parsed.spawnPoints ?? []);
-        setWorldTree(parsed.worldTree ?? null);
+        setWorldTrees(loadWorldTrees(parsed));
         setSelected(null);
         setEditMode('terrain');
         return;
@@ -256,7 +276,7 @@ export default function HexMapEditor() {
         const parsed = JSON.parse(ev.target?.result as string) as MapData;
         setData(parsed);
         setSpawnPoints(parsed.spawnPoints ?? []);
-        setWorldTree(parsed.worldTree ?? null);
+        setWorldTrees(loadWorldTrees(parsed));
         setSelected(null);
         setEditMode('terrain');
       } catch {
@@ -269,11 +289,28 @@ export default function HexMapEditor() {
   // Helper to get export data
   const getExportData = () => {
     if (!data) return null;
-    return {
+
+    // Determine export format based on number of world trees
+    const exportData: MapData = {
       ...data,
       spawnPoints: spawnPoints.length > 0 ? spawnPoints : undefined,
-      worldTree: worldTree ?? undefined,
-    } as MapData;
+    };
+
+    if (worldTrees.length === 0) {
+      // No trees - remove both fields
+      delete exportData.worldTree;
+      delete exportData.worldTrees;
+    } else if (worldTrees.length === 1) {
+      // Single tree - use legacy format for backward compatibility
+      exportData.worldTree = { q: worldTrees[0].q, r: worldTrees[0].r };
+      delete exportData.worldTrees;
+    } else {
+      // Multiple trees - use new format
+      exportData.worldTrees = worldTrees;
+      delete exportData.worldTree;
+    }
+
+    return exportData;
   };
 
   // Save directly to original file (if we have handle)
@@ -424,16 +461,25 @@ export default function HexMapEditor() {
 
   // World tree helpers
   const isWorldTree = (q: number, r: number) => {
-    return worldTree?.q === q && worldTree?.r === r;
+    return worldTrees.some(t => t.q === q && t.r === r);
   };
 
-  const setWorldTreeAt = (q: number, r: number) => {
-    // Toggle: if clicking same tile, remove; otherwise set new location
-    if (worldTree?.q === q && worldTree?.r === r) {
-      setWorldTree(null);
-    } else {
-      setWorldTree({ q, r });
-    }
+  const getWorldTreeAt = (q: number, r: number): WorldTree | undefined => {
+    return worldTrees.find(t => t.q === q && t.r === r);
+  };
+
+  const toggleWorldTreeAt = (q: number, r: number) => {
+    setWorldTrees(prev => {
+      const existingIndex = prev.findIndex(t => t.q === q && t.r === r);
+      if (existingIndex >= 0) {
+        // Remove this tree
+        return prev.filter((_, i) => i !== existingIndex);
+      } else {
+        // Add new tree with next available treeId
+        const maxId = prev.length > 0 ? Math.max(...prev.map(t => t.treeId)) : -1;
+        return [...prev, { q, r, treeId: maxId + 1 }];
+      }
+    });
   };
 
   // Hex click handler - supports Ctrl+click for multi-select
@@ -441,7 +487,7 @@ export default function HexMapEditor() {
     if (editMode === 'spawn') {
       toggleSpawnPoint(hex.q, hex.r);
     } else if (editMode === 'goal') {
-      setWorldTreeAt(hex.q, hex.r);
+      toggleWorldTreeAt(hex.q, hex.r);
     } else {
       if (e.ctrlKey || e.metaKey) {
         // Ctrl+click: toggle this hex in multi-selection
@@ -716,10 +762,10 @@ export default function HexMapEditor() {
                             textAnchor="middle"
                             dominantBaseline="central"
                             fill="white"
-                            fontSize={sizePx * 0.4}
+                            fontSize={sizePx * 0.35}
                             fontWeight="bold"
                           >
-                            T
+                            {worldTrees.length > 1 ? `T${getWorldTreeAt(hex.q, hex.r)?.treeId ?? ''}` : 'T'}
                           </text>
                         </g>
                       )}
@@ -853,7 +899,7 @@ export default function HexMapEditor() {
               className="flex-1"
               style={editMode === 'goal' ? { backgroundColor: '#22c55e' } : {}}
             >
-              🌳 Goal {worldTree ? '✓' : ''}
+              🌳 Trees ({worldTrees.length})
             </Button>
           </div>
         )}
@@ -1001,23 +1047,28 @@ export default function HexMapEditor() {
         {/* Goal mode info panel */}
         {editMode === 'goal' && (
           <div className="mt-4 p-3 bg-green-50 border border-green-200 rounded-lg">
-            <h3 className="text-lg font-medium text-green-700">Goal/Tree Mode</h3>
-            <p className="text-sm text-green-600 mt-1">Click a hex to set the World Tree location (goal)</p>
-            {worldTree ? (
+            <h3 className="text-lg font-medium text-green-700">World Trees Mode</h3>
+            <p className="text-sm text-green-600 mt-1">Click hexes to add/remove World Trees (goals)</p>
+            <p className="text-xs text-green-500 mt-1">Multiple trees = multi-lane mode</p>
+            {worldTrees.length > 0 ? (
               <div className="mt-2">
-                <p className="text-sm font-medium text-green-700">Current location:</p>
-                <div className="flex justify-between items-center mt-1">
-                  <span className="text-sm text-green-600">({worldTree.q}, {worldTree.r})</span>
-                  <button
-                    onClick={() => setWorldTree(null)}
-                    className="text-green-400 hover:text-green-600 text-xs"
-                  >
-                    ✕ Remove
-                  </button>
-                </div>
+                <p className="text-sm font-medium text-green-700">Current trees:</p>
+                <ul className="text-xs text-green-600 mt-1 max-h-32 overflow-y-auto">
+                  {worldTrees.map((tree) => (
+                    <li key={tree.treeId} className="flex justify-between items-center py-0.5">
+                      <span>Tree {tree.treeId}: ({tree.q}, {tree.r})</span>
+                      <button
+                        onClick={() => toggleWorldTreeAt(tree.q, tree.r)}
+                        className="text-green-400 hover:text-green-600 text-xs"
+                      >
+                        ✕
+                      </button>
+                    </li>
+                  ))}
+                </ul>
               </div>
             ) : (
-              <p className="text-xs text-green-400 mt-2 italic">No goal set yet</p>
+              <p className="text-xs text-green-400 mt-2 italic">No trees set yet</p>
             )}
           </div>
         )}
