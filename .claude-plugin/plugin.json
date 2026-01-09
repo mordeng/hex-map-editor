@@ -1,0 +1,8 @@
+{
+  "name": "ralph-wiggum",
+  "version": "1.0.0",
+  "description": "Autonomous iterative development loops for Claude Code. Named after Ralph Wiggum - perpetually confused, frequently making mistakes, but never stops trying.",
+  "author": "ralphi",
+  "commands": "./commands",
+  "hooks": "./hooks"
+}

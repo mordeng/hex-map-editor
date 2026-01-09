@@ -1,0 +1,10 @@
+{
+  "enabledPlugins": {
+    "ralph-wiggum@local": true
+  },
+  "plugins": {
+    "ralph-wiggum@local": {
+      "path": "."
+    }
+  }
+}
