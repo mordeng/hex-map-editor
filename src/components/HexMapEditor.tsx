@@ -26,6 +26,7 @@ export interface Hex {
   asset: string;
   terrain: string;
   tier: number;
+  rotation: number; // -1 = no rotation, 0-5 = hex edge rotation
 }
 export interface SpawnPoint {
   q: number;
@@ -218,6 +219,8 @@ export default function HexMapEditor() {
     fetch('/hex-map-editor/bordered_map.json')
       .then(res => res.json())
       .then((parsed: MapData) => {
+        // Ensure rotation field exists with default -1 for backward compatibility
+        parsed.map = parsed.map.map(h => ({ ...h, rotation: h.rotation ?? -1 }));
         setData(parsed);
         setSpawnPoints(parsed.spawnPoints ?? []);
         setWorldTrees(loadWorldTrees(parsed));
@@ -246,6 +249,7 @@ export default function HexMapEditor() {
         const file = await fileHandle.getFile();
         const text = await file.text();
         const parsed = JSON.parse(text) as MapData;
+        parsed.map = parsed.map.map(h => ({ ...h, rotation: h.rotation ?? -1 }));
         setData(parsed);
         setSpawnPoints(parsed.spawnPoints ?? []);
         setWorldTrees(loadWorldTrees(parsed));
@@ -274,6 +278,7 @@ export default function HexMapEditor() {
     reader.onload = ev => {
       try {
         const parsed = JSON.parse(ev.target?.result as string) as MapData;
+        parsed.map = parsed.map.map(h => ({ ...h, rotation: h.rotation ?? -1 }));
         setData(parsed);
         setSpawnPoints(parsed.spawnPoints ?? []);
         setWorldTrees(loadWorldTrees(parsed));
@@ -1118,6 +1123,30 @@ export default function HexMapEditor() {
                   >
                     +
                   </Button>
+                </div>
+              </div>
+              <div>
+                <Label>Rotation</Label>
+                <div className="flex items-center gap-1 flex-wrap">
+                  <Button
+                    variant={selected.rotation === -1 ? 'default' : 'outline'}
+                    size="sm"
+                    onClick={() => updateHex('rotation', -1)}
+                    className={selected.rotation === -1 ? 'bg-gray-700' : ''}
+                  >
+                    None
+                  </Button>
+                  {[0, 1, 2, 3, 4, 5].map(r => (
+                    <Button
+                      key={r}
+                      variant={selected.rotation === r ? 'default' : 'outline'}
+                      size="sm"
+                      onClick={() => updateHex('rotation', r)}
+                      className={selected.rotation === r ? 'bg-blue-600' : ''}
+                    >
+                      {r}
+                    </Button>
+                  ))}
                 </div>
               </div>
               <div>
