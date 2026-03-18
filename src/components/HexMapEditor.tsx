@@ -56,6 +56,7 @@ const TERRAIN_COLOURS: Record<string, string> = {
   forest: '#237804',
   swamp: '#08979c',
   road: '#b37f4c',
+  lava: '#e25822',
 };
 const SQRT3 = Math.sqrt(3);
 
