@@ -941,7 +941,6 @@ export default function HexMapEditor() {
   const zoomPct = Math.round(scale * 100);
   const crumbName = fileName.replace(/\.[^.]+$/, '').toUpperCase();
   const showSelected = !!selected && editMode === 'select';
-  const paintCursor = editMode === 'brush';
 
   // ==========================================================================
   return (
@@ -986,7 +985,7 @@ export default function HexMapEditor() {
           <canvas
             ref={canvasRef}
             className="map"
-            style={{ cursor: paintCursor ? 'crosshair' : 'grab' }}
+            style={{ cursor: 'crosshair' }}
             onMouseDown={onMouseDown}
             onMouseMove={onMouseMove}
             onMouseUp={onMouseUp}
