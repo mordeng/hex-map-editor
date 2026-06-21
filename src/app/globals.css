@@ -256,13 +256,15 @@
   .tool svg { width: 20px; height: 20px; }
   .tool:hover { background: var(--ink-600); color: var(--fg-primary); }
   .tool.active { background: var(--sun-400); color: var(--ink-900); }
-  .tool .badge {
-    position: absolute; top: -2px; right: -2px; min-width: 16px; height: 16px;
+  /* Wrapper so the count badge isn't clipped by the tool's hexagon clip-path. */
+  .tool-wrap { position: relative; display: grid; place-items: center; }
+  .tool-wrap .badge {
+    position: absolute; top: -3px; right: -3px; min-width: 16px; height: 16px;
     padding: 0 4px; border-radius: 999px; background: var(--cinder-500); color: #fff;
     font-size: 10px; font-weight: 700; display: grid; place-items: center;
-    letter-spacing: 0; box-shadow: 0 0 0 2px #11151c;
+    letter-spacing: 0; box-shadow: 0 0 0 2px #11151c; pointer-events: none;
   }
-  .tool .badge.canopy { background: var(--canopy-400); }
+  .tool-wrap .badge.canopy { background: var(--canopy-400); }
   .rail .rule { width: 24px; height: 1px; background: var(--border-hairline); margin: 4px 0; }
 
   /* ----- Canvas stage ----- */
@@ -270,7 +272,7 @@
   .stage canvas.map { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
   .stage::after {
     content: ""; position: absolute; inset: 0; pointer-events: none;
-    background: radial-gradient(ellipse at center, transparent 52%, rgba(0,0,0,0.5) 100%);
+    background: radial-gradient(ellipse at center, transparent 74%, rgba(0,0,0,0.16) 100%);
   }
   .stage .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--fg-muted); font-size: 13px; letter-spacing: 0.16em; text-transform: uppercase; }
 
@@ -453,4 +455,23 @@
   .m-msg.ok { color: var(--canopy-400); }
   .m-msg.err { color: var(--cinder-bright); }
   .btn.primary.ok { background: var(--canopy-400); border-color: var(--canopy-600); color: var(--ink-900); }
+
+  /* ----- Gallery modal ----- */
+  .modal.wide { width: 920px; }
+  .g-empty { text-align: center; color: var(--fg-muted); padding: 48px 0; font-size: 13px; letter-spacing: 0.14em; text-transform: uppercase; }
+  .gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 14px; }
+  .gcard { border: 1px solid var(--border-hairline); border-radius: var(--r-md); background: rgba(0,0,0,0.25); overflow: hidden; cursor: pointer; transition: all .15s ease; position: relative; }
+  .gcard:hover { border-color: var(--sun-400); box-shadow: 0 0 0 1px var(--sun-400) inset; }
+  .gthumb-wrap { position: relative; height: 130px; background: #0b0e14; border-bottom: 1px solid var(--border-hairline); }
+  canvas.gthumb { width: 100%; height: 130px; display: block; }
+  .gthumb-fail { position: absolute; inset: 0; display: grid; place-items: center; color: var(--fg-muted); font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; }
+  .gcard-body { padding: 10px 11px; }
+  .gcard-top { display: flex; align-items: baseline; gap: 6px; }
+  .gnm { font-size: 14px; font-weight: 700; letter-spacing: 0.03em; color: var(--sun-300); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .gbiome { margin-left: auto; flex: none; font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--fg-muted); border: 1px solid var(--border-hairline); padding: 2px 6px; border-radius: 999px; }
+  .gmeta { font-size: 11px; color: var(--fg-secondary); margin-top: 4px; }
+  .gload { position: absolute; inset: 0 0 auto 0; top: 130px; display: none; }
+  .gcard:hover .gthumb-wrap::after { content: ""; position: absolute; inset: 0; background: rgba(236,200,70,0.12); }
+  .gcard:hover .gload { display: flex; align-items: center; justify-content: center; gap: 6px; position: absolute; left: 50%; top: 65px; transform: translate(-50%, -50%); height: 32px; padding: 0 14px; border-radius: var(--r-sm); background: var(--sun-400); color: var(--ink-900); font-weight: 700; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; box-shadow: var(--shadow-card); }
+  .gload svg { width: 14px; height: 14px; }
 }

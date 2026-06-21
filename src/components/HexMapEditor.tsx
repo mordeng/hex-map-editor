@@ -6,7 +6,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Hexagon, Upload, Undo2, Save, CopyPlus, Brush, MapPin, MousePointer2,
-  Palette, List, ChevronUp, ChevronDown, Minus, Plus, Maximize, TreePine, Box, Send, X,
+  Palette, List, ChevronUp, ChevronDown, Minus, Plus, Maximize, TreePine, Box, Send, X, LayoutGrid,
 } from 'lucide-react';
 
 // wtd-analytics map-submission endpoint (override if the deployed domain differs)
@@ -116,6 +116,73 @@ type EditMode = 'select' | 'brush' | 'spawn' | 'goal';
 
 interface Snapshot { map: Hex[]; spawnPoints: SpawnPoint[]; worldTrees: WorldTree[] }
 
+interface GalleryItem {
+  name: string;
+  biome: string;
+  submittedBy: string;
+  notes?: string;
+  ts: number;
+  url: string;
+  stats?: { hexes: number; spawns: number; goals: number; biomes: number };
+}
+
+// Draw a small flat-shaded thumbnail of a map document onto a canvas.
+function drawThumb(canvas: HTMLCanvasElement, data: MapData) {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const W = canvas.clientWidth || 260, H = canvas.clientHeight || 150;
+  canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const hexes = data.map || [];
+  if (!hexes.length) return;
+  const orientation: Orientation = data.orientation === 'flat' ? 'flat' : 'pointy';
+  const maxR = Math.max(...hexes.map(h => h.r));
+  const size = 10;
+  const coords = hexes.map(h => axialToPixel(h.q, h.r, size, orientation, true, true, true, maxR));
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const c of coords) { if (c.x < minX) minX = c.x; if (c.x > maxX) maxX = c.x; if (c.y < minY) minY = c.y; if (c.y > maxY) maxY = c.y; }
+  const bw = (maxX - minX) + size * 2, bh = (maxY - minY) + size * 2;
+  const scale = Math.min(W / bw, H / bh) * 0.96;
+  const ox = (W - bw * scale) / 2 - (minX - size) * scale;
+  const oy = (H - bh * scale) / 2 - (minY - size) * scale;
+  const s = size * scale;
+  const spawn = new Set((data.spawnPoints || []).map(p => `${p.q},${p.r}`));
+  const trees = new Set<string>();
+  if (Array.isArray(data.worldTrees)) data.worldTrees.forEach(t => trees.add(`${t.q},${t.r}`));
+  else if (data.worldTree) trees.add(`${data.worldTree.q},${data.worldTree.r}`);
+  for (let i = 0; i < hexes.length; i++) {
+    const h = hexes[i], c = coords[i];
+    const cx = c.x * scale + ox, cy = c.y * scale + oy;
+    const corners = hexCorners(cx, cy, s, orientation);
+    ctx.beginPath(); corners.forEach((pt, j) => (j ? ctx.lineTo(pt[0], pt[1]) : ctx.moveTo(pt[0], pt[1]))); ctx.closePath();
+    ctx.fillStyle = terrainFill(h.terrain); ctx.fill();
+    if (h.tier >= 2) { ctx.fillStyle = 'rgba(12,15,21,0.42)'; ctx.fill(); }
+    else if (h.tier === 1) { ctx.fillStyle = 'rgba(12,15,21,0.22)'; ctx.fill(); }
+  }
+  for (let i = 0; i < hexes.length; i++) {
+    const h = hexes[i], key = `${h.q},${h.r}`, c = coords[i];
+    const cx = c.x * scale + ox, cy = c.y * scale + oy;
+    if (trees.has(key)) { ctx.beginPath(); ctx.arc(cx, cy, Math.max(1.5, s * 0.7), 0, 7); ctx.fillStyle = '#ecc846'; ctx.fill(); ctx.lineWidth = Math.max(1, s * 0.25); ctx.strokeStyle = '#14181f'; ctx.stroke(); }
+    else if (spawn.has(key)) { ctx.beginPath(); ctx.arc(cx, cy, Math.max(1.3, s * 0.6), 0, 7); ctx.fillStyle = '#d3491b'; ctx.fill(); ctx.lineWidth = Math.max(1, s * 0.22); ctx.strokeStyle = '#fff'; ctx.stroke(); }
+  }
+}
+
+function GalleryThumb({ url }: { url: string }) {
+  const ref = useRef<HTMLCanvasElement | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    fetch(url)
+      .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+      .then((data: MapData) => { if (!cancelled && ref.current) drawThumb(ref.current, data); })
+      .catch(() => { if (!cancelled) setFailed(true); });
+    return () => { cancelled = true; };
+  }, [url]);
+  return failed ? <div className="gthumb-fail">No preview</div> : <canvas ref={ref} className="gthumb" />;
+}
+
 export default function HexMapEditor() {
   const [data, setData] = useState<MapData | null>(null);
   const [selected, setSelected] = useState<Hex | null>(null);
@@ -136,6 +203,12 @@ export default function HexMapEditor() {
 
   const [selCollapsed, setSelCollapsed] = useState(false);
   const [isometric, setIsometric] = useState(false);
+
+  // Map gallery modal
+  const [galleryOpen, setGalleryOpen] = useState(false);
+  const [galleryMaps, setGalleryMaps] = useState<GalleryItem[]>([]);
+  const [galleryState, setGalleryState] = useState<'idle' | 'loading' | 'error'>('idle');
+  const [galleryErr, setGalleryErr] = useState('');
 
   // Submit-to-analytics modal
   const [submitOpen, setSubmitOpen] = useState(false);
@@ -441,27 +514,45 @@ export default function HexMapEditor() {
     return Math.min(viewSize.w / bounds.w, viewSize.h / bounds.h) * 0.92;
   }, [viewSize, bounds]);
 
-  // world<->screen share one transform with the renderer (keeps clicks aligned)
-  const worldToScreen = useCallback((wx: number, wy: number) => {
-    const eff = fitScale * scale;
-    return {
-      x: (wx - bounds.w / 2) * eff + viewSize.w / 2 + offset.x,
-      y: (wy - bounds.h / 2) * eff + viewSize.h / 2 + offset.y,
-    };
-  }, [bounds, fitScale, scale, viewSize, offset]);
+  // Cached world-pixel centre per hex (positions never change while editing, so
+  // computing them every frame / every mousemove was pure waste).
+  const hexCenters = useMemo(() => {
+    const m = new Map<string, { x: number; y: number }>();
+    if (data) for (const h of data.map) m.set(h.id, axialToPixel(h.q, h.r, sizePx, data.orientation, rect, stagger, mirror, maxR));
+    return m;
+  }, [data, sizePx, rect, stagger, mirror, maxR]);
+
+  // Spatial hash of hex centres so hit-testing is O(1) instead of scanning all hexes.
+  const cellSize = sizePx * 1.5;
+  const hexIndex = useMemo(() => {
+    const grid = new Map<string, Hex[]>();
+    if (data) for (const h of data.map) {
+      const c = hexCenters.get(h.id)!;
+      const key = `${Math.floor(c.x / cellSize)},${Math.floor(c.y / cellSize)}`;
+      (grid.get(key) ?? grid.set(key, []).get(key)!).push(h);
+    }
+    return grid;
+  }, [data, hexCenters, cellSize]);
 
   const findHexAtPoint = useCallback((wx: number, wy: number): Hex | null => {
     if (!data) return null;
+    const threshold = sizePx * 0.9;
+    const cx = Math.floor(wx / cellSize), cy = Math.floor(wy / cellSize);
     let closest: Hex | null = null;
     let closestDist = Infinity;
-    const threshold = sizePx * 0.9;
-    for (const hex of data.map) {
-      const { x, y } = axialToPixel(hex.q, hex.r, sizePx, data.orientation, rect, stagger, mirror, maxR);
-      const dist = Math.sqrt((wx - x) ** 2 + (wy - y) ** 2);
-      if (dist < threshold && dist < closestDist) { closest = hex; closestDist = dist; }
+    for (let gx = cx - 1; gx <= cx + 1; gx++) {
+      for (let gy = cy - 1; gy <= cy + 1; gy++) {
+        const cell = hexIndex.get(`${gx},${gy}`);
+        if (!cell) continue;
+        for (const hex of cell) {
+          const c = hexCenters.get(hex.id)!;
+          const dist = Math.sqrt((wx - c.x) ** 2 + (wy - c.y) ** 2);
+          if (dist < threshold && dist < closestDist) { closest = hex; closestDist = dist; }
+        }
+      }
     }
     return closest;
-  }, [data, sizePx, rect, stagger, mirror, maxR]);
+  }, [data, sizePx, cellSize, hexIndex, hexCenters]);
 
   // mouse(client) -> world, the exact inverse of worldToScreen
   const eventToWorld = useCallback((clientX: number, clientY: number) => {
@@ -621,6 +712,19 @@ export default function HexMapEditor() {
     const s = sizePx * eff;                    // hex radius on screen
     const tierH = sizePx * 0.5 * eff;          // elevation per tier on screen
     const orientation = data.orientation;
+    const halfW = bounds.w / 2, halfH = bounds.h / 2;
+    const baseX = W / 2 + offset.x, baseY = H / 2 + offset.y;
+
+    // Precompute the 6 corner unit vectors once (constant per orientation) so we
+    // don't call cos/sin for every hex every frame.
+    const offDeg = orientation === 'pointy' ? 30 : 0;
+    const ux: number[] = [], uy: number[] = [];
+    for (let i = 0; i < 6; i++) { const a = ((offDeg + 60 * i) * Math.PI) / 180; ux.push(Math.cos(a)); uy.push(Math.sin(a)); }
+    const tracePath = (cx: number, cy: number, rad: number) => {
+      ctx.beginPath();
+      for (let i = 0; i < 6; i++) { const X = cx + rad * ux[i], Y = cy + rad * uy[i]; if (i) ctx.lineTo(X, Y); else ctx.moveTo(X, Y); }
+      ctx.closePath();
+    };
 
     const order = isometric
       ? [...data.map].sort((a, b) => (a.r - a.tier * 0.5) - (b.r - b.tier * 0.5))
@@ -630,67 +734,62 @@ export default function HexMapEditor() {
     for (const hex of data.map) {
       const tree = treeMap.has(`${hex.q},${hex.r}`);
       if (hex.terrain !== 'lava' && !tree) continue;
-      const p = axialToPixel(hex.q, hex.r, sizePx, orientation, rect, stagger, mirror, maxR);
-      const sc = worldToScreen(p.x, p.y);
-      const cy = sc.y - (isometric ? hex.tier * tierH : 0);
-      if (sc.x < -s * 2 || sc.x > W + s * 2 || cy < -s * 2 || cy > H + s * 2) continue;
-      const g = ctx.createRadialGradient(sc.x, cy, 0, sc.x, cy, s * 1.6);
+      const p = hexCenters.get(hex.id); if (!p) continue;
+      const scx = (p.x - halfW) * eff + baseX;
+      const cy = (p.y - halfH) * eff + baseY - (isometric ? hex.tier * tierH : 0);
+      if (scx < -s * 2 || scx > W + s * 2 || cy < -s * 2 || cy > H + s * 2) continue;
+      const g = ctx.createRadialGradient(scx, cy, 0, scx, cy, s * 1.6);
       g.addColorStop(0, tree ? 'rgba(110,169,63,0.5)' : 'rgba(255,110,30,0.42)');
       g.addColorStop(1, 'rgba(0,0,0,0)');
       ctx.fillStyle = g;
-      ctx.beginPath(); ctx.arc(sc.x, cy, s * 1.6, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(scx, cy, s * 1.6, 0, Math.PI * 2); ctx.fill();
     }
 
     const selId = selected?.id;
     const multi = selectedMultiple;
 
     for (const hex of order) {
-      const p = axialToPixel(hex.q, hex.r, sizePx, orientation, rect, stagger, mirror, maxR);
-      const sc = worldToScreen(p.x, p.y);
-      const cy = sc.y - (isometric ? hex.tier * tierH : 0);
-      if (sc.x < -s * 2 || sc.x > W + s * 2 || cy < -s * 2 || cy > H + s * 2) continue;
+      const p = hexCenters.get(hex.id); if (!p) continue;
+      const scx = (p.x - halfW) * eff + baseX;
+      const scyBase = (p.y - halfH) * eff + baseY;
+      const cy = scyBase - (isometric ? hex.tier * tierH : 0);
+      if (scx < -s * 2 || scx > W + s * 2 || cy < -s * 2 || cy > H + s * 2) continue;
 
       const T = TERRAIN[hex.terrain] ?? TERRAIN.grass;
 
       // elevation walls
       if (isometric && hex.tier > 0) {
-        const top = hexCorners(sc.x, cy, s, orientation);
-        const bot = hexCorners(sc.x, sc.y, s, orientation);
         const edges = [2, 3, 4];
         const shades = [0.5, 0.4, 0.45];
-        edges.forEach((idx, i) => {
-          const n = (idx + 1) % 6;
+        for (let e = 0; e < 3; e++) {
+          const idx = edges[e], n = (idx + 1) % 6;
           ctx.beginPath();
-          ctx.moveTo(top[idx][0], top[idx][1]);
-          ctx.lineTo(top[n][0], top[n][1]);
-          ctx.lineTo(bot[n][0], bot[n][1]);
-          ctx.lineTo(bot[idx][0], bot[idx][1]);
+          ctx.moveTo(scx + s * ux[idx], cy + s * uy[idx]);
+          ctx.lineTo(scx + s * ux[n], cy + s * uy[n]);
+          ctx.lineTo(scx + s * ux[n], scyBase + s * uy[n]);
+          ctx.lineTo(scx + s * ux[idx], scyBase + s * uy[idx]);
           ctx.closePath();
-          ctx.fillStyle = darkenColor(T.fill, shades[i]);
+          ctx.fillStyle = darkenColor(T.fill, shades[e]);
           ctx.fill();
           ctx.lineWidth = Math.max(0.5, s * 0.02);
           ctx.strokeStyle = 'rgba(12,15,21,0.55)';
           ctx.stroke();
-        });
+        }
       }
 
-      // top face
-      const pts = hexCorners(sc.x, cy, s * 0.97, orientation);
-      ctx.beginPath();
-      pts.forEach((pt, i) => (i ? ctx.lineTo(pt[0], pt[1]) : ctx.moveTo(pt[0], pt[1])));
-      ctx.closePath();
-      const g = ctx.createLinearGradient(sc.x, cy - s, sc.x, cy + s);
-      g.addColorStop(0, T.top); g.addColorStop(0.55, T.fill); g.addColorStop(1, T.bot);
-      ctx.fillStyle = g; ctx.fill();
-      ctx.lineWidth = Math.max(1, s * 0.05);
-      ctx.strokeStyle = 'rgba(12,15,21,0.45)';
+      // top face — flat terrain colour, faint edge (calm + cheap)
+      tracePath(scx, cy, s);
+      ctx.fillStyle = T.fill; ctx.fill();
+      ctx.lineWidth = Math.max(0.4, s * 0.03);
+      ctx.strokeStyle = 'rgba(12,15,21,0.14)';
       ctx.stroke();
 
       // tier darkening
       if (hex.tier >= 1) {
+        tracePath(scx, cy, s);
         ctx.save(); ctx.clip();
         ctx.fillStyle = hex.tier >= 2 ? 'rgba(20,24,31,0.40)' : 'rgba(20,24,31,0.22)';
-        ctx.fillRect(sc.x - s, cy - s, 2 * s, 2 * s);
+        ctx.fillRect(scx - s, cy - s, 2 * s, 2 * s);
         ctx.restore();
       }
 
@@ -701,9 +800,7 @@ export default function HexMapEditor() {
       // marker footprint aura (rings around spawns / world trees)
       const aura = auraMap.get(key);
       if (aura && !isSpawn && !isTree) {
-        ctx.beginPath();
-        pts.forEach((pt, i) => (i ? ctx.lineTo(pt[0], pt[1]) : ctx.moveTo(pt[0], pt[1])));
-        ctx.closePath();
+        tracePath(scx, cy, s);
         ctx.fillStyle = aura === 'spawn' ? 'rgba(211,73,27,0.30)'
           : aura === 'tree1' ? 'rgba(110,169,63,0.62)' : 'rgba(110,169,63,0.40)';
         ctx.fill();
@@ -715,17 +812,16 @@ export default function HexMapEditor() {
 
       // markers
       if (isTree) {
-        const ip = hexCorners(sc.x, cy, s * 0.5, orientation);
-        ctx.beginPath(); ip.forEach((pt, i) => (i ? ctx.lineTo(pt[0], pt[1]) : ctx.moveTo(pt[0], pt[1]))); ctx.closePath();
+        tracePath(scx, cy, s * 0.5);
         ctx.fillStyle = '#ecc846'; ctx.fill();
         ctx.lineWidth = Math.max(1, s * 0.05); ctx.strokeStyle = '#14181f'; ctx.stroke();
         if (worldTrees.length > 1) {
           ctx.fillStyle = '#14181f'; ctx.font = `bold ${Math.round(s * 0.5)}px var(--font-ui, sans-serif)`;
           ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-          ctx.fillText(String(treeMap.get(`${hex.q},${hex.r}`)), sc.x, cy);
+          ctx.fillText(String(treeMap.get(key)), scx, cy);
         }
       } else if (isSpawn) {
-        ctx.beginPath(); ctx.arc(sc.x, cy, s * 0.34, 0, Math.PI * 2);
+        ctx.beginPath(); ctx.arc(scx, cy, s * 0.34, 0, Math.PI * 2);
         ctx.fillStyle = '#d3491b'; ctx.fill();
         ctx.lineWidth = Math.max(1.5, s * 0.07); ctx.strokeStyle = '#fff'; ctx.stroke();
       }
@@ -735,17 +831,15 @@ export default function HexMapEditor() {
       const isMulti = multi.has(hex.id);
       if (isSel || isMulti) {
         ctx.save();
-        ctx.beginPath();
-        pts.forEach((pt, i) => (i ? ctx.lineTo(pt[0], pt[1]) : ctx.moveTo(pt[0], pt[1])));
-        ctx.closePath();
+        tracePath(scx, cy, s);
         if (isSel) { ctx.shadowColor = 'rgba(246,217,112,0.85)'; ctx.shadowBlur = 14; ctx.strokeStyle = '#f6d970'; ctx.lineWidth = Math.max(2, s * 0.1); }
         else { ctx.strokeStyle = '#ecc846'; ctx.lineWidth = Math.max(1.5, s * 0.06); }
         ctx.stroke();
         ctx.restore();
       }
     }
-  }, [data, viewSize, sizePx, scale, fitScale, isometric, rect, stagger, mirror, maxR,
-    spawnSet, treeMap, auraMap, worldTrees, selected, selectedMultiple, worldToScreen]);
+  }, [data, viewSize, sizePx, scale, fitScale, offset, bounds, isometric, hexCenters,
+    spawnSet, treeMap, auraMap, worldTrees, selected, selectedMultiple]);
 
   drawRef.current = draw;
 
@@ -754,6 +848,36 @@ export default function HexMapEditor() {
 
   // ---- inspector helpers ----------------------------------------------------
   const choosePaletteTerrain = (t: string) => setBrushTerrain(t);
+
+  // ---- map gallery (browse + load submitted maps) ----
+  const openGallery = async () => {
+    setGalleryOpen(true);
+    setGalleryState('loading');
+    setGalleryErr('');
+    try {
+      const res = await fetch(`${ANALYTICS_BASE}/api/maps`, { headers: { 'X-Submit-Token': SUBMIT_TOKEN } });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setGalleryMaps(Array.isArray(data.maps) ? data.maps : []);
+      setGalleryState('idle');
+    } catch {
+      setGalleryState('error');
+      setGalleryErr('Could not load the gallery.');
+    }
+  };
+
+  const loadFromGallery = async (item: GalleryItem) => {
+    try {
+      const res = await fetch(item.url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const parsed = (await res.json()) as MapData;
+      lastFileHandle.current = null; // loaded from gallery -> Save becomes Save As
+      applyLoadedMap(parsed, item.name ? `${item.name}.json` : 'map.json');
+      setGalleryOpen(false);
+    } catch {
+      setGalleryErr('Failed to load that map.');
+    }
+  };
 
   // ---- submit to wtd-analytics ----
   const submitStats = useMemo(() => ({
@@ -832,6 +956,7 @@ export default function HexMapEditor() {
         <div className="mapcrumb"><span className="dot" /> MAP <b>{crumbName || '—'}</b></div>
         <div className="spacer" />
         <button className="btn ghost" onClick={handleImportClick}><Upload /> Import</button>
+        <button className="btn ghost" onClick={openGallery}><LayoutGrid /> Gallery</button>
         <button className={`btn${canUndo ? '' : ' disabled'}`} onClick={undo}><Undo2 /> Undo</button>
         <button className={`btn${data ? '' : ' disabled'}`} onClick={handleSave}><Save /> Save</button>
         <button className={`btn${data ? '' : ' disabled'}`} onClick={handleExport}><CopyPlus /> Save As</button>
@@ -844,12 +969,14 @@ export default function HexMapEditor() {
         <nav className="rail">
           <button className={`tool${editMode === 'select' ? ' active' : ''}`} title="Select" onClick={() => setEditMode('select')}><MousePointer2 /></button>
           <button className={`tool${editMode === 'brush' ? ' active' : ''}`} title="Brush / paint terrain" onClick={() => setEditMode('brush')}><Brush /></button>
-          <button className={`tool${editMode === 'spawn' ? ' active' : ''}`} title="Spawn markers" onClick={() => setEditMode('spawn')}>
-            <MapPin />{spawnPoints.length > 0 && <span className="badge">{spawnPoints.length}</span>}
-          </button>
-          <button className={`tool${editMode === 'goal' ? ' active' : ''}`} title="Goal / World Trees" onClick={() => setEditMode('goal')}>
-            <TreePine />{worldTrees.length > 0 && <span className="badge canopy">{worldTrees.length}</span>}
-          </button>
+          <div className="tool-wrap">
+            <button className={`tool${editMode === 'spawn' ? ' active' : ''}`} title="Spawn markers" onClick={() => setEditMode('spawn')}><MapPin /></button>
+            {spawnPoints.length > 0 && <span className="badge">{spawnPoints.length}</span>}
+          </div>
+          <div className="tool-wrap">
+            <button className={`tool${editMode === 'goal' ? ' active' : ''}`} title="Goal / World Trees" onClick={() => setEditMode('goal')}><TreePine /></button>
+            {worldTrees.length > 0 && <span className="badge canopy">{worldTrees.length}</span>}
+          </div>
         </nav>
 
         {/* ============ CANVAS STAGE ============ */}
@@ -1013,6 +1140,47 @@ export default function HexMapEditor() {
           )}
         </aside>
       </div>
+
+      {/* ============ GALLERY MODAL ============ */}
+      {galleryOpen && (
+        <div className="overlay" onMouseDown={e => { if (e.target === e.currentTarget) setGalleryOpen(false); }}>
+          <div className="modal wide" role="dialog" aria-modal="true">
+            <div className="modal-head">
+              <div className="m-ico"><LayoutGrid /></div>
+              <div>
+                <h2>Map Gallery</h2>
+                <div className="m-sub">{galleryState === 'idle' ? `${galleryMaps.length} submitted maps` : 'Submitted maps'}</div>
+              </div>
+              <button className="icon-btn" onClick={() => setGalleryOpen(false)}><X /></button>
+            </div>
+            <div className="modal-body">
+              {galleryState === 'loading' && <div className="g-empty">Loading…</div>}
+              {galleryState === 'error' && <div className="g-empty">{galleryErr}</div>}
+              {galleryState === 'idle' && galleryMaps.length === 0 && <div className="g-empty">No maps submitted yet.</div>}
+              {galleryState === 'idle' && galleryMaps.length > 0 && (
+                <>
+                  {galleryErr && <div className="g-empty" style={{ padding: '0 0 8px' }}>{galleryErr}</div>}
+                  <div className="gallery-grid">
+                    {galleryMaps.map((m, i) => (
+                      <div key={i} className="gcard" onClick={() => loadFromGallery(m)} title="Click to load">
+                        <div className="gthumb-wrap"><GalleryThumb url={m.url} /></div>
+                        <div className="gcard-body">
+                          <div className="gcard-top">
+                            <span className="gnm">{m.name || 'untitled'}</span>
+                            <span className="gbiome">{m.biome || '—'}</span>
+                          </div>
+                          <div className="gmeta">by {m.submittedBy || 'anonymous'} · {m.stats?.hexes ?? '—'} hexes</div>
+                        </div>
+                        <div className="gload"><Upload /> Load</div>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ============ SUBMIT MODAL ============ */}
       {submitOpen && data && (
