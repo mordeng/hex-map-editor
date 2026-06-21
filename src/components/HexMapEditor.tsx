@@ -1,19 +1,22 @@
 'use client';
-// Hex Map Editor – pan & zoom, mirroring, stagger, rect/rhombus, pointy/flat, live shading
+// Hex Map Editor – World Tree Defender styling, canvas-rendered.
+// pan & zoom, mirroring, stagger, rect/rhombus, pointy/flat, painterly fills,
+// brush tool, undo, spawn & goal markers, tier elevation view.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { motion } from 'framer-motion';
-import { Card, CardContent } from '@/components/ui/card';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
+  Hexagon, Upload, Undo2, Save, CopyPlus, Brush, MapPin, MousePointer2,
+  Palette, List, ChevronUp, ChevronDown, Minus, Plus, Maximize, TreePine, Box, Send, X,
+} from 'lucide-react';
+
+// wtd-analytics map-submission endpoint (override if the deployed domain differs)
+// wtd-analytics base URL — override at build time with NEXT_PUBLIC_WTD_ANALYTICS_BASE.
+const ANALYTICS_BASE = process.env.NEXT_PUBLIC_WTD_ANALYTICS_BASE || 'https://wtd-analytics.vercel.app';
+// Low-value, map-submit-only token (rate-limited server-side). Embedded so any
+// editor user can submit without entering anything. Override at build time with
+// NEXT_PUBLIC_WTD_SUBMIT_TOKEN; must match MAP_SUBMIT_TOKEN on wtd-analytics.
+const SUBMIT_TOKEN = process.env.NEXT_PUBLIC_WTD_SUBMIT_TOKEN || 'wtdmap_e8370e8e965fef19b5748ed2104c57ee3ba1f633';
+const BIOMES = ['Cinderheart', 'Verdant Veil', 'Miremaw', 'Other'];
 
 // --------------------------------------------------------------------------
 // TYPES & CONSTANTS
@@ -28,16 +31,8 @@ export interface Hex {
   tier: number;
   rotation: number; // -1 = no rotation, 0-5 = hex edge rotation
 }
-export interface SpawnPoint {
-  q: number;
-  r: number;
-}
-
-export interface WorldTree {
-  q: number;
-  r: number;
-  treeId: number;
-}
+export interface SpawnPoint { q: number; r: number }
+export interface WorldTree { q: number; r: number; treeId: number }
 
 export interface MapData {
   hexSize: number;
@@ -48,36 +43,33 @@ export interface MapData {
   worldTrees?: WorldTree[]; // Multiple trees for multi-lane mode
 }
 
-const TERRAIN_COLOURS: Record<string, string> = {
-  grass: '#52c41a',
-  water: '#1890ff',
-  sand: '#fadb14',
-  mountain: '#8c8c8c',
-  forest: '#237804',
-  swamp: '#08979c',
-  road: '#b37f4c',
-  lava: '#e25822',
+// Painterly terrain palette (top / fill / bottom for vertical gradient)
+interface TerrainDef { fill: string; top: string; bot: string }
+const TERRAIN: Record<string, TerrainDef> = {
+  grass: { fill: '#6ea93f', top: '#86c456', bot: '#4f7e2c' },
+  water: { fill: '#3f7fa6', top: '#5aa0c4', bot: '#2c5d7e' },
+  sand: { fill: '#d8c074', top: '#ecd690', bot: '#b89c52' },
+  mountain: { fill: '#6b7280', top: '#8c93a0', bot: '#4d5462' },
+  forest: { fill: '#3f7a2a', top: '#52923a', bot: '#295417' },
+  swamp: { fill: '#2f7a6a', top: '#3f9684', bot: '#1f594c' },
+  road: { fill: '#8a6a44', top: '#a3855c', bot: '#5b4128' },
+  lava: { fill: '#d3491b', top: '#ff7a1f', bot: '#7a2510' },
 };
+const TERRAIN_ORDER = ['grass', 'water', 'sand', 'mountain', 'forest', 'swamp', 'road', 'lava'];
 const SQRT3 = Math.sqrt(3);
+const terrainFill = (t: string) => (TERRAIN[t] ?? TERRAIN.grass).fill;
 
 // --------------------------------------------------------------------------
 // GEOMETRY HELPERS
 // --------------------------------------------------------------------------
 function axialToPixel(
-  q: number,
-  r: number,
-  size: number,
-  orientation: Orientation,
-  rect: boolean,
-  stagger: boolean,
-  mirror: boolean,
-  maxR: number,
+  q: number, r: number, size: number, orientation: Orientation,
+  rect: boolean, stagger: boolean, mirror: boolean, maxR: number,
 ) {
   const rr = mirror ? maxR - r : r;
   if (orientation === 'pointy') {
     const baseX = size * SQRT3 * (rect ? q : q + rr / 2);
     const y = size * 1.5 * rr;
-    // Use original r for stagger to maintain row alignment when mirroring
     const x = stagger ? baseX + ((r % 2) * SQRT3 * size) / 2 : baseX;
     return { x, y };
   }
@@ -87,83 +79,42 @@ function axialToPixel(
   return { x, y };
 }
 
-function hexPoints(cx: number, cy: number, size: number, orientation: Orientation) {
+// Hexagon corner offsets (unit circle) for a given orientation
+function hexCorners(cx: number, cy: number, s: number, orientation: Orientation): [number, number][] {
   const offsetDeg = orientation === 'pointy' ? 30 : 0;
-  return Array.from({ length: 6 }, (_, i) => {
-    const ang = ((offsetDeg + 60 * i) * Math.PI) / 180;
-    return `${cx + size * Math.cos(ang)},${cy + size * Math.sin(ang)}`;
-  }).join(' ');
+  const pts: [number, number][] = [];
+  for (let i = 0; i < 6; i++) {
+    const a = ((offsetDeg + 60 * i) * Math.PI) / 180;
+    pts.push([cx + s * Math.cos(a), cy + s * Math.sin(a)]);
+  }
+  return pts;
 }
 
-function shadeColour(hex: Hex, minH: number, maxH: number) {
-  const base = TERRAIN_COLOURS[hex.terrain] ?? '#cccccc';
-  const t = (hex.tier - minH) / Math.max(1, maxH - minH);
-  const mix = (c: number) => Math.round(c + (255 - c) * t);
-  const rB = parseInt(base.slice(1, 3), 16);
-  const gB = parseInt(base.slice(3, 5), 16);
-  const bB = parseInt(base.slice(5, 7), 16);
-  return `#${[mix(rB), mix(gB), mix(bB)].map(v => v.toString(16).padStart(2, '0')).join('')}`;
-}
-
-// Darken a hex color by a percentage (0-1)
 function darkenColor(color: string, amount: number): string {
   const r = parseInt(color.slice(1, 3), 16);
   const g = parseInt(color.slice(3, 5), 16);
   const b = parseInt(color.slice(5, 7), 16);
-  const darken = (c: number) => Math.round(c * (1 - amount));
-  return `#${[darken(r), darken(g), darken(b)].map(v => v.toString(16).padStart(2, '0')).join('')}`;
+  const d = (c: number) => Math.round(c * (1 - amount));
+  return `#${[d(r), d(g), d(b)].map(v => v.toString(16).padStart(2, '0')).join('')}`;
 }
 
-// Get hex corner points as array of {x, y}
-function getHexCorners(cx: number, cy: number, size: number, orientation: Orientation): {x: number, y: number}[] {
-  const offsetDeg = orientation === 'pointy' ? 30 : 0;
-  return Array.from({ length: 6 }, (_, i) => {
-    const ang = ((offsetDeg + 60 * i) * Math.PI) / 180;
-    return { x: cx + size * Math.cos(ang), y: cy + size * Math.sin(ang) };
-  });
-}
-
-// Get wall polygons for a hex (visible sides based on isometric view)
-function getHexWalls(
-  cx: number,
-  cy: number,
-  size: number,
-  orientation: Orientation,
-  tierHeight: number
-): { points: string; shade: number }[] {
-  const corners = getHexCorners(cx, cy, size, orientation);
-  const walls: { points: string; shade: number }[] = [];
-
-  // For pointy-top hex, draw bottom 3 walls (indices 2-3, 3-4, 4-5)
-  // These are the walls visible from front when elevated hexes go up/backward
-  const visibleEdges = orientation === 'pointy' ? [2, 3, 4] : [2, 3, 4];
-
-  visibleEdges.forEach((startIdx, i) => {
-    const endIdx = (startIdx + 1) % 6;
-    const baseCorner1 = corners[startIdx];
-    const baseCorner2 = corners[endIdx];
-    // Top of wall is elevated (negative Y = up/backward in tilted view)
-    const top1 = { x: baseCorner1.x, y: baseCorner1.y - tierHeight };
-    const top2 = { x: baseCorner2.x, y: baseCorner2.y - tierHeight };
-    // Bottom of wall is at base level
-    const bot1 = baseCorner1;
-    const bot2 = baseCorner2;
-
-    // Shade varies by wall angle (left darker, center medium, right lighter)
-    const shades = [0.5, 0.4, 0.45];
-    walls.push({
-      points: `${top1.x},${top1.y} ${top2.x},${top2.y} ${bot2.x},${bot2.y} ${bot1.x},${bot1.y}`,
-      shade: shades[i],
-    });
-  });
-
-  return walls;
+// Odd-r offset neighbour deltas (the map staggers odd rows right, so the six
+// neighbours depend on row parity). Returns the 6 adjacent (q,r) coordinates.
+const ODDR_DIRS: [number, number][][] = [
+  [[1, 0], [0, -1], [-1, -1], [-1, 0], [-1, 1], [0, 1]],   // even rows
+  [[1, 0], [1, -1], [0, -1], [-1, 0], [0, 1], [1, 1]],     // odd rows
+];
+function offsetNeighbors(q: number, r: number): [number, number][] {
+  const parity = ((r % 2) + 2) % 2;
+  return ODDR_DIRS[parity].map(([dq, dr]) => [q + dq, r + dr] as [number, number]);
 }
 
 // --------------------------------------------------------------------------
 // MAIN COMPONENT
 // --------------------------------------------------------------------------
-type EditMode = 'terrain' | 'spawn' | 'goal';
+type EditMode = 'select' | 'brush' | 'spawn' | 'goal';
+
+interface Snapshot { map: Hex[]; spawnPoints: SpawnPoint[]; worldTrees: WorldTree[] }
 
 export default function HexMapEditor() {
   const [data, setData] = useState<MapData | null>(null);
@@ -172,357 +123,273 @@ export default function HexMapEditor() {
   const [rect] = useState(true);
   const [stagger] = useState(true);
   const [mirror] = useState(true);
+  const [fileName, setFileName] = useState('cinderheart_v2.json');
 
-  // Edit mode, spawn points, and world trees
-  const [editMode, setEditMode] = useState<EditMode>('terrain');
+  const [editMode, setEditMode] = useState<EditMode>('select');
   const [spawnPoints, setSpawnPoints] = useState<SpawnPoint[]>([]);
   const [worldTrees, setWorldTrees] = useState<WorldTree[]>([]);
 
-  // Brush tool
-  const [brushEnabled, setBrushEnabled] = useState(false);
   const [brushTerrain, setBrushTerrain] = useState<string>('grass');
   const [brushTier, setBrushTier] = useState<number>(0);
   const isBrushPainting = useRef(false);
   const paintedInStroke = useRef<Set<string>>(new Set());
 
-  // Isometric 3D view
+  const [selCollapsed, setSelCollapsed] = useState(false);
   const [isometric, setIsometric] = useState(false);
-  const [tiltAngle, setTiltAngle] = useState(45);
 
-  // pan & zoom
+  // Submit-to-analytics modal
+  const [submitOpen, setSubmitOpen] = useState(false);
+  const [subName, setSubName] = useState('');
+  const [subBiome, setSubBiome] = useState(BIOMES[0]);
+  const [subBy, setSubBy] = useState('');
+  const [subNotes, setSubNotes] = useState('');
+  const [subStatus, setSubStatus] = useState<'idle' | 'sending' | 'ok' | 'error'>('idle');
+  const [subMsg, setSubMsg] = useState('');
+
+  // camera
   const [scale, setScale] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const [viewSize, setViewSize] = useState({ w: 0, h: 0 });
   const isPanning = useRef(false);
   const isDragSelecting = useRef(false);
   const start = useRef({ x: 0, y: 0 });
 
+  // undo
+  const historyRef = useRef<Snapshot[]>([]);
+  const [, setHistoryVersion] = useState(0);
+  const canUndo = historyRef.current.length > 0;
+
   const fileRef = useRef<HTMLInputElement | null>(null);
-  const svgRef = useRef<SVGSVGElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const drawRef = useRef<(() => void) | null>(null); // latest draw(), for imperative redraws
   const lastFileHandle = useRef<FileSystemFileHandle | null>(null);
   const lastFileName = useRef<string>('map.json');
 
-  // Helper to load world trees from map data (handles both legacy and new format)
+  const dataRef = useRef(data); dataRef.current = data;
+  const spawnPointsRef = useRef(spawnPoints); spawnPointsRef.current = spawnPoints;
+  const worldTreesRef = useRef(worldTrees); worldTreesRef.current = worldTrees;
+
+  // ---- load -----------------------------------------------------------------
   const loadWorldTrees = (parsed: MapData): WorldTree[] => {
-    // Priority 1: worldTrees array (multi-lane mode)
-    if (parsed.worldTrees && parsed.worldTrees.length > 0) {
-      return parsed.worldTrees;
-    }
-    // Priority 2: Legacy single worldTree
-    if (parsed.worldTree) {
-      return [{ q: parsed.worldTree.q, r: parsed.worldTree.r, treeId: 0 }];
-    }
+    if (parsed.worldTrees && parsed.worldTrees.length > 0) return parsed.worldTrees;
+    if (parsed.worldTree) return [{ q: parsed.worldTree.q, r: parsed.worldTree.r, treeId: 0 }];
     return [];
   };
 
-  // Load default map on mount
-  useEffect(() => {
-    // Always use basePath since it's configured in next.config.ts
-    fetch('/hex-map-editor/bordered_map.json')
-      .then(res => res.json())
-      .then((parsed: MapData) => {
-        // Ensure rotation field exists with default -1 for backward compatibility
-        parsed.map = parsed.map.map(h => ({ ...h, rotation: h.rotation ?? -1 }));
-        setData(parsed);
-        setSpawnPoints(parsed.spawnPoints ?? []);
-        setWorldTrees(loadWorldTrees(parsed));
-      })
-      .catch(err => console.error('Failed to load default map:', err));
+  const applyLoadedMap = useCallback((parsed: MapData, name?: string) => {
+    parsed.map = parsed.map.map(h => ({ ...h, rotation: h.rotation ?? -1 }));
+    setData(parsed);
+    setSpawnPoints(parsed.spawnPoints ?? []);
+    setWorldTrees(loadWorldTrees(parsed));
+    setSelected(null);
+    setSelectedMultiple(new Set());
+    setEditMode('select');
+    setScale(1);
+    setOffset({ x: 0, y: 0 });
+    historyRef.current = [];
+    setHistoryVersion(v => v + 1);
+    if (name) setFileName(name);
   }, []);
 
-  // File IO - use File System Access API for import to get file handle
+  useEffect(() => {
+    const loadDefault = () => fetch('/hex-map-editor/cinderheart_v2.json')
+      .then(res => res.json())
+      .then((parsed: MapData) => applyLoadedMap(parsed, 'cinderheart_v2.json'))
+      .catch(err => console.error('Failed to load default map:', err));
+
+    // ?load=<url> — open a specific map (e.g. a submitted map's Blob URL).
+    const loadUrl = new URLSearchParams(window.location.search).get('load');
+    if (loadUrl) {
+      fetch(loadUrl)
+        .then(res => { if (!res.ok) throw new Error(`HTTP ${res.status}`); return res.json(); })
+        .then((parsed: MapData) => {
+          const name = decodeURIComponent((loadUrl.split('/').pop() || 'map.json').split('?')[0]) || 'map.json';
+          applyLoadedMap(parsed, name);
+        })
+        .catch(err => { console.error('Failed to load map from ?load=', err); loadDefault(); });
+      return;
+    }
+    loadDefault();
+  }, [applyLoadedMap]);
+
+  // ---- undo -----------------------------------------------------------------
+  const pushHistory = useCallback(() => {
+    const cur = dataRef.current;
+    if (!cur) return;
+    historyRef.current.push({
+      map: cur.map.map(h => ({ ...h })),
+      spawnPoints: spawnPointsRef.current.map(s => ({ ...s })),
+      worldTrees: worldTreesRef.current.map(t => ({ ...t })),
+    });
+    if (historyRef.current.length > 100) historyRef.current.shift();
+    setHistoryVersion(v => v + 1);
+  }, []);
+
+  const undo = useCallback(() => {
+    const snap = historyRef.current.pop();
+    if (!snap) return;
+    setData(prev => (prev ? { ...prev, map: snap.map } : prev));
+    setSpawnPoints(snap.spawnPoints);
+    setWorldTrees(snap.worldTrees);
+    setSelected(prev => (prev ? snap.map.find(h => h.id === prev.id) ?? null : null));
+    setHistoryVersion(v => v + 1);
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'z') {
+        const t = e.target as HTMLElement | null;
+        if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
+        e.preventDefault();
+        undo();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [undo]);
+
+  // ---- file IO --------------------------------------------------------------
   const handleImportClick = useCallback(async () => {
-    // Try File System Access API first to get file handle
     if ('showOpenFilePicker' in window) {
       try {
-        const [fileHandle] = await (window as Window & { showOpenFilePicker: (options?: object) => Promise<FileSystemFileHandle[]> }).showOpenFilePicker({
-          types: [
-            {
-              description: 'JSON Files',
-              accept: { 'application/json': ['.json'] },
-            },
-          ],
+        const [fileHandle] = await (window as Window & { showOpenFilePicker: (o?: object) => Promise<FileSystemFileHandle[]> }).showOpenFilePicker({
+          types: [{ description: 'JSON Files', accept: { 'application/json': ['.json'] } }],
         });
-
-        // Store file handle and name for export
         lastFileHandle.current = fileHandle;
         lastFileName.current = fileHandle.name;
-
         const file = await fileHandle.getFile();
-        const text = await file.text();
-        const parsed = JSON.parse(text) as MapData;
-        parsed.map = parsed.map.map(h => ({ ...h, rotation: h.rotation ?? -1 }));
-        setData(parsed);
-        setSpawnPoints(parsed.spawnPoints ?? []);
-        setWorldTrees(loadWorldTrees(parsed));
-        setSelected(null);
-        setEditMode('terrain');
+        applyLoadedMap(JSON.parse(await file.text()) as MapData, fileHandle.name);
         return;
       } catch (err) {
         if ((err as Error).name === 'AbortError') return;
-        // Fall through to file input
       }
     }
-
-    // Fallback to file input
     fileRef.current?.click();
-  }, []);
+  }, [applyLoadedMap]);
 
   const handleImport = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-
-    // Store filename for export (clear file handle since we used fallback)
     lastFileName.current = file.name;
     lastFileHandle.current = null;
-
     const reader = new FileReader();
     reader.onload = ev => {
       try {
-        const parsed = JSON.parse(ev.target?.result as string) as MapData;
-        parsed.map = parsed.map.map(h => ({ ...h, rotation: h.rotation ?? -1 }));
-        setData(parsed);
-        setSpawnPoints(parsed.spawnPoints ?? []);
-        setWorldTrees(loadWorldTrees(parsed));
-        setSelected(null);
-        setEditMode('terrain');
-      } catch {
-        alert('Invalid JSON');
-      }
+        applyLoadedMap(JSON.parse(ev.target?.result as string) as MapData, file.name);
+      } catch { alert('Invalid JSON'); }
     };
     reader.readAsText(file);
-  }, []);
+  }, [applyLoadedMap]);
 
-  // Helper to get export data
   const getExportData = () => {
     if (!data) return null;
-
-    // Determine export format based on number of world trees
-    const exportData: MapData = {
-      ...data,
-      spawnPoints: spawnPoints.length > 0 ? spawnPoints : undefined,
-    };
-
-    if (worldTrees.length === 0) {
-      // No trees - remove both fields
-      delete exportData.worldTree;
-      delete exportData.worldTrees;
-    } else if (worldTrees.length === 1) {
-      // Single tree - use legacy format for backward compatibility
-      exportData.worldTree = { q: worldTrees[0].q, r: worldTrees[0].r };
-      delete exportData.worldTrees;
-    } else {
-      // Multiple trees - use new format
-      exportData.worldTrees = worldTrees;
-      delete exportData.worldTree;
-    }
-
+    const exportData: MapData = { ...data, spawnPoints: spawnPoints.length > 0 ? spawnPoints : undefined };
+    if (worldTrees.length === 0) { delete exportData.worldTree; delete exportData.worldTrees; }
+    else if (worldTrees.length === 1) { exportData.worldTree = { q: worldTrees[0].q, r: worldTrees[0].r }; delete exportData.worldTrees; }
+    else { exportData.worldTrees = worldTrees; delete exportData.worldTree; }
     return exportData;
   };
 
-  // Save directly to original file (if we have handle)
   const handleSave = async () => {
     const exportData = getExportData();
     if (!exportData) return;
-
     const jsonContent = JSON.stringify(exportData, null, 2);
-
-    // If we have a file handle from import, use it
     if (lastFileHandle.current) {
       try {
         const writable = await lastFileHandle.current.createWritable();
         await writable.write(jsonContent);
         await writable.close();
         return;
-      } catch (err) {
-        // Permission denied or other error - fall through to Save As
-        console.log('Could not save to original file, using Save As...', err);
-      }
+      } catch (err) { console.log('Could not save to original file, using Save As...', err); }
     }
-
-    // No file handle, fall through to Save As behavior
     await handleExport();
   };
 
-  // Save As - always shows file picker
   const handleExport = async () => {
     const exportData = getExportData();
     if (!exportData) return;
-
     const jsonContent = JSON.stringify(exportData, null, 2);
-
-    // Try to use File System Access API for save dialog
     if ('showSaveFilePicker' in window) {
       try {
-        const handle = await (window as Window & { showSaveFilePicker: (options?: object) => Promise<FileSystemFileHandle> }).showSaveFilePicker({
+        const handle = await (window as Window & { showSaveFilePicker: (o?: object) => Promise<FileSystemFileHandle> }).showSaveFilePicker({
           suggestedName: lastFileName.current,
-          types: [
-            {
-              description: 'JSON Files',
-              accept: { 'application/json': ['.json'] },
-            },
-          ],
+          types: [{ description: 'JSON Files', accept: { 'application/json': ['.json'] } }],
         });
         const writable = await handle.createWritable();
         await writable.write(jsonContent);
         await writable.close();
-
-        // Update file handle and filename for future saves
         lastFileHandle.current = handle;
         lastFileName.current = handle.name;
+        setFileName(handle.name);
         return;
-      } catch (err) {
-        // User cancelled or API not supported - fall back to download
-        if ((err as Error).name === 'AbortError') return;
-      }
+      } catch (err) { if ((err as Error).name === 'AbortError') return; }
     }
-
-    // Fallback to download approach for unsupported browsers
     const blob = new Blob([jsonContent], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url;
-    a.download = lastFileName.current;
-    a.click();
+    a.href = url; a.download = lastFileName.current; a.click();
     URL.revokeObjectURL(url);
   };
 
-  // Update helper - supports both single and multi-select
+  // ---- mutations ------------------------------------------------------------
   const updateHex = <K extends keyof Hex>(k: K, v: Hex[K]) => {
     if (!data) return;
-
-    // If we have multiple selections, update all of them
+    pushHistory();
     if (selectedMultiple.size > 0) {
-      setData({
-        ...data,
-        map: data.map.map(mapHex =>
-          selectedMultiple.has(mapHex.id) ? { ...mapHex, [k]: v } : mapHex
-        )
-      });
-      // Also update the primary selected if it's in the multi-selection
-      if (selected && selectedMultiple.has(selected.id)) {
-        setSelected(prev => (prev ? { ...prev, [k]: v } : prev));
-      }
+      setData({ ...data, map: data.map.map(h => (selectedMultiple.has(h.id) ? { ...h, [k]: v } : h)) });
+      if (selected && selectedMultiple.has(selected.id)) setSelected(prev => (prev ? { ...prev, [k]: v } : prev));
     } else if (selected) {
-      // Single selection mode
-      setData({ ...data, map: data.map.map(mapHex => (mapHex.id === selected.id ? { ...mapHex, [k]: v } : mapHex)) });
+      setData({ ...data, map: data.map.map(h => (h.id === selected.id ? { ...h, [k]: v } : h)) });
       setSelected(prev => (prev ? { ...prev, [k]: v } : prev));
     }
   };
 
-  // Store updateHex in a ref so the wheel handler can access it
-  const updateHexRef = useRef(updateHex);
-  updateHexRef.current = updateHex;
+  const updateHexRef = useRef(updateHex); updateHexRef.current = updateHex;
+  const selectedRef = useRef(selected); selectedRef.current = selected;
+  const selectedMultipleRef = useRef(selectedMultiple); selectedMultipleRef.current = selectedMultiple;
+  const editModeRef = useRef(editMode); editModeRef.current = editMode;
+  const scaleRef = useRef(scale); scaleRef.current = scale;
+  const wheelRafRef = useRef(0);
+  const pendingScaleRef = useRef<number | null>(null);
 
-  // Store selected, selectedMultiple, and editMode in refs for wheel handler
-  const selectedRef = useRef(selected);
-  selectedRef.current = selected;
-  const selectedMultipleRef = useRef(selectedMultiple);
-  selectedMultipleRef.current = selectedMultiple;
-  const editModeRef = useRef(editMode);
-  editModeRef.current = editMode;
-
-  // Non-passive wheel event listener to block page scroll
-  useEffect(() => {
-    const svg = svgRef.current;
-    if (!svg) return;
-
-    const handleWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
-
-      const currentSelected = selectedRef.current;
-      const currentSelectedMultiple = selectedMultipleRef.current;
-      const currentEditMode = editModeRef.current;
-
-      // Allow scroll to change tier if we have selection(s) in terrain mode
-      const hasSelection = currentSelected || currentSelectedMultiple.size > 0;
-      if (hasSelection && currentEditMode === 'terrain') {
-        const delta = e.deltaY > 0 ? -1 : 1;
-        // Use the primary selected hex tier as base for calculation
-        const baseTier = currentSelected?.tier ?? 0;
-        const newTier = Math.max(0, Math.min(3, baseTier + delta));
-        updateHexRef.current('tier', newTier);
-      }
-    };
-
-    svg.addEventListener('wheel', handleWheel, { passive: false });
-    return () => svg.removeEventListener('wheel', handleWheel);
-  }, [data]); // Re-run when data changes (SVG mounts/unmounts)
-
-  // Spawn point helpers
-  const isSpawnPoint = (q: number, r: number) => {
-    return spawnPoints.some(sp => sp.q === q && sp.r === r);
-  };
-
-  const toggleSpawnPoint = (q: number, r: number) => {
+  const toggleSpawnPoint = useCallback((q: number, r: number) => {
+    pushHistory();
     setSpawnPoints(prev => {
       const exists = prev.find(sp => sp.q === q && sp.r === r);
-      if (exists) {
-        return prev.filter(sp => !(sp.q === q && sp.r === r));
-      } else {
-        return [...prev, { q, r }];
-      }
+      return exists ? prev.filter(sp => !(sp.q === q && sp.r === r)) : [...prev, { q, r }];
     });
-  };
+  }, [pushHistory]);
 
-  // World tree helpers
-  const isWorldTree = (q: number, r: number) => {
-    return worldTrees.some(t => t.q === q && t.r === r);
-  };
-
-  const getWorldTreeAt = (q: number, r: number): WorldTree | undefined => {
-    return worldTrees.find(t => t.q === q && t.r === r);
-  };
-
-  const toggleWorldTreeAt = (q: number, r: number) => {
+  const toggleWorldTreeAt = useCallback((q: number, r: number) => {
+    pushHistory();
     setWorldTrees(prev => {
       const existingIndex = prev.findIndex(t => t.q === q && t.r === r);
-      if (existingIndex >= 0) {
-        // Remove this tree
-        return prev.filter((_, i) => i !== existingIndex);
-      } else {
-        // Add new tree with next available treeId
-        const maxId = prev.length > 0 ? Math.max(...prev.map(t => t.treeId)) : -1;
-        return [...prev, { q, r, treeId: maxId + 1 }];
-      }
+      if (existingIndex >= 0) return prev.filter((_, i) => i !== existingIndex);
+      const maxId = prev.length > 0 ? Math.max(...prev.map(t => t.treeId)) : -1;
+      return [...prev, { q, r, treeId: maxId + 1 }];
     });
-  };
+  }, [pushHistory]);
 
-  // Hex click handler - supports Ctrl+click for multi-select
-  const handleHexClick = (hex: Hex, e: React.MouseEvent) => {
-    if (editMode === 'spawn') {
-      toggleSpawnPoint(hex.q, hex.r);
-    } else if (editMode === 'goal') {
-      toggleWorldTreeAt(hex.q, hex.r);
+  const onHexClick = useCallback((hex: Hex, e: { ctrlKey: boolean; metaKey: boolean }) => {
+    const mode = editModeRef.current;
+    if (mode === 'spawn') { toggleSpawnPoint(hex.q, hex.r); return; }
+    if (mode === 'goal') { toggleWorldTreeAt(hex.q, hex.r); return; }
+    if (e.ctrlKey || e.metaKey) {
+      const cur = selectedRef.current;
+      setSelectedMultiple(prev => {
+        const newSet = new Set(prev);
+        if (newSet.size === 0 && cur && cur.id !== hex.id) newSet.add(cur.id);
+        if (newSet.has(hex.id)) newSet.delete(hex.id); else newSet.add(hex.id);
+        return newSet;
+      });
+      setSelected(hex);
     } else {
-      if (e.ctrlKey || e.metaKey) {
-        // Ctrl+click: toggle this hex in multi-selection
-        setSelectedMultiple(prev => {
-          const newSet = new Set(prev);
-
-          // If starting multi-select and we have a single selection, add it first
-          if (newSet.size === 0 && selected && selected.id !== hex.id) {
-            newSet.add(selected.id);
-          }
-
-          if (newSet.has(hex.id)) {
-            newSet.delete(hex.id);
-          } else {
-            newSet.add(hex.id);
-          }
-          return newSet;
-        });
-        // Set as primary selected for the sidebar display
-        setSelected(hex);
-      } else {
-        // Normal click: clear multi-selection and select single
-        setSelectedMultiple(new Set());
-        setSelected(hex);
-      }
+      setSelectedMultiple(new Set());
+      setSelected(hex);
     }
-  };
+  }, [toggleSpawnPoint, toggleWorldTreeAt]);
 
-  // Derived
+  // ---- derived --------------------------------------------------------------
   const sizePx = (data?.hexSize ?? 1) * 100;
   const maxR = useMemo(() => (data ? Math.max(...data.map.map(h => h.r)) : 0), [data]);
   const bounds = useMemo(() => {
@@ -534,632 +401,670 @@ export default function HexMapEditor() {
     };
   }, [data, sizePx, rect, stagger, mirror, maxR]);
 
-  const [minH, maxH] = useMemo(() => {
-    if (!data) return [0, 1];
-    const hs = data.map.map(h => h.tier);
-    return [Math.min(...hs), Math.max(...hs)];
-  }, [data]);
+  const spawnSet = useMemo(() => new Set(spawnPoints.map(sp => `${sp.q},${sp.r}`)), [spawnPoints]);
+  const treeMap = useMemo(() => {
+    const m = new Map<string, number>();
+    worldTrees.forEach(t => m.set(`${t.q},${t.r}`, t.treeId));
+    return m;
+  }, [worldTrees]);
 
-  // Find hex at SVG coordinates
-  const findHexAtPoint = useCallback((svgX: number, svgY: number): Hex | null => {
+  // Highlighted footprint around markers: spawns mark their 1st ring (6 hexes),
+  // world trees mark their 1st + 2nd ring (6 + 12 hexes).
+  type Aura = 'spawn' | 'tree2' | 'tree1';
+  const auraMap = useMemo(() => {
+    const m = new Map<string, Aura>();
+    for (const sp of spawnPoints) {
+      for (const [q, r] of offsetNeighbors(sp.q, sp.r)) m.set(`${q},${r}`, 'spawn');
+    }
+    for (const t of worldTrees) {
+      const center = `${t.q},${t.r}`;
+      const ring1 = offsetNeighbors(t.q, t.r);
+      const ring1Keys = new Set(ring1.map(([q, r]) => `${q},${r}`));
+      const ring2 = new Set<string>();
+      for (const [q, r] of ring1) {
+        for (const [nq, nr] of offsetNeighbors(q, r)) {
+          const k = `${nq},${nr}`;
+          if (k === center || ring1Keys.has(k)) continue;
+          ring2.add(k);
+        }
+      }
+      for (const k of ring2) m.set(k, 'tree2');
+      for (const k of ring1Keys) m.set(k, 'tree1'); // ring1 wins over ring2 overlaps
+    }
+    return m;
+  }, [spawnPoints, worldTrees]);
+
+  // Base scale that fits the whole map in the viewport => "100%" shows everything.
+  // The user-facing `scale` (100% = 1) multiplies on top of this.
+  const fitScale = useMemo(() => {
+    if (!viewSize.w || !viewSize.h) return 1;
+    return Math.min(viewSize.w / bounds.w, viewSize.h / bounds.h) * 0.92;
+  }, [viewSize, bounds]);
+
+  // world<->screen share one transform with the renderer (keeps clicks aligned)
+  const worldToScreen = useCallback((wx: number, wy: number) => {
+    const eff = fitScale * scale;
+    return {
+      x: (wx - bounds.w / 2) * eff + viewSize.w / 2 + offset.x,
+      y: (wy - bounds.h / 2) * eff + viewSize.h / 2 + offset.y,
+    };
+  }, [bounds, fitScale, scale, viewSize, offset]);
+
+  const findHexAtPoint = useCallback((wx: number, wy: number): Hex | null => {
     if (!data) return null;
-    // Check each hex and find the closest one within range
     let closest: Hex | null = null;
     let closestDist = Infinity;
-    const threshold = sizePx * 0.9; // Slightly smaller than hex size for better accuracy
-
+    const threshold = sizePx * 0.9;
     for (const hex of data.map) {
       const { x, y } = axialToPixel(hex.q, hex.r, sizePx, data.orientation, rect, stagger, mirror, maxR);
-      const dist = Math.sqrt((svgX - x) ** 2 + (svgY - y) ** 2);
-      if (dist < threshold && dist < closestDist) {
-        closest = hex;
-        closestDist = dist;
-      }
+      const dist = Math.sqrt((wx - x) ** 2 + (wy - y) ** 2);
+      if (dist < threshold && dist < closestDist) { closest = hex; closestDist = dist; }
     }
     return closest;
   }, [data, sizePx, rect, stagger, mirror, maxR]);
 
-  // Convert mouse event to SVG coordinates
-  const mouseToSvg = useCallback((e: React.MouseEvent<SVGSVGElement>): { x: number; y: number } | null => {
-    const svg = svgRef.current;
-    if (!svg) return null;
-    const svgRect = svg.getBoundingClientRect();
-    const viewBox = svg.viewBox.baseVal;
-    const scaleX = viewBox.width / svgRect.width;
-    const scaleY = viewBox.height / svgRect.height;
+  // mouse(client) -> world, the exact inverse of worldToScreen
+  const eventToWorld = useCallback((clientX: number, clientY: number) => {
+    const c = canvasRef.current;
+    if (!c) return null;
+    const r = c.getBoundingClientRect();
+    const sx = clientX - r.left;
+    const sy = clientY - r.top;
+    const eff = fitScale * scale;
     return {
-      x: (e.clientX - svgRect.left) * scaleX,
-      y: (e.clientY - svgRect.top) * scaleY,
+      x: (sx - r.width / 2 - offset.x) / eff + bounds.w / 2,
+      y: (sy - r.height / 2 - offset.y) / eff + bounds.h / 2,
     };
-  }, []);
+  }, [offset, fitScale, scale, bounds]);
 
-  // Paint hex with brush (skips already painted in this stroke)
+  // ---- painting -------------------------------------------------------------
+  // Hot path: mutate the hex in place and redraw imperatively (no React state
+  // churn). The stroke is committed to state once on mouse-up.
   const paintHexWithBrush = useCallback((hex: Hex) => {
-    if (!data) return;
-    // Skip if already painted in this stroke
     if (paintedInStroke.current.has(hex.id)) return;
-    // Skip if hex already has same terrain and tier
-    if (hex.terrain === brushTerrain && hex.tier === brushTier) return;
-
+    const terrain = brushTerrain;
+    const tier = brushTier;
+    if (hex.terrain === terrain && hex.tier === tier) return;
     paintedInStroke.current.add(hex.id);
-    setData(prev => {
-      if (!prev) return prev;
-      return {
-        ...prev,
-        map: prev.map.map(h =>
-          h.id === hex.id ? { ...h, terrain: brushTerrain, tier: brushTier } : h
-        ),
-      };
-    });
-  }, [data, brushTerrain, brushTier]);
+    hex.terrain = terrain;
+    hex.tier = tier;
+    drawRef.current?.();
+  }, [brushTerrain, brushTier]);
 
-  // Handlers -------------------------------------------------------------
-  const onMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
+  const onMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (e.button !== 0) return;
-
-    if (brushEnabled && editMode === 'terrain') {
-      // Start brush painting
-      isBrushPainting.current = true;
-      isPanning.current = false;
-      isDragSelecting.current = false;
-      paintedInStroke.current.clear(); // Reset for new stroke
-      // Paint the hex under cursor immediately
-      const svgPoint = mouseToSvg(e);
-      if (svgPoint) {
-        const hex = findHexAtPoint(svgPoint.x, svgPoint.y);
-        if (hex) paintHexWithBrush(hex);
+    const paintMode = editMode === 'brush';
+    const world = eventToWorld(e.clientX, e.clientY);
+    if (paintMode) {
+      isBrushPainting.current = true; isPanning.current = false; isDragSelecting.current = false;
+      paintedInStroke.current.clear();
+      pushHistory();
+      if (world) {
+        const hex = findHexAtPoint(world.x, world.y);
+        if (hex) { paintHexWithBrush(hex); setSelected(hex); }
       }
-    } else if ((e.ctrlKey || e.metaKey) && editMode === 'terrain') {
-      // Start drag-select mode
-      isDragSelecting.current = true;
-      isPanning.current = false;
-      isBrushPainting.current = false;
+    } else if ((e.ctrlKey || e.metaKey) && editMode === 'select') {
+      isDragSelecting.current = true; isPanning.current = false; isBrushPainting.current = false;
+      if (world) { const hex = findHexAtPoint(world.x, world.y); if (hex) onHexClick(hex, e); }
+    } else if (editMode === 'spawn' || editMode === 'goal') {
+      // single click toggles a marker; still allow pan if dragged
+      isPanning.current = true; isDragSelecting.current = false; isBrushPainting.current = false;
+      start.current = { x: e.clientX - offset.x, y: e.clientY - offset.y };
+      if (world) { const hex = findHexAtPoint(world.x, world.y); if (hex) onHexClick(hex, e); }
     } else {
-      // Normal pan
-      isPanning.current = true;
-      isDragSelecting.current = false;
-      isBrushPainting.current = false;
+      // select mode -> select hex + pan on drag
+      if (world) { const hex = findHexAtPoint(world.x, world.y); if (hex) onHexClick(hex, e); }
+      isPanning.current = true; isDragSelecting.current = false; isBrushPainting.current = false;
       start.current = { x: e.clientX - offset.x, y: e.clientY - offset.y };
     }
   };
 
-  const onMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
-    // Brush painting
-    if (isBrushPainting.current && brushEnabled) {
-      const svgPoint = mouseToSvg(e);
-      if (svgPoint) {
-        const hex = findHexAtPoint(svgPoint.x, svgPoint.y);
-        if (hex) paintHexWithBrush(hex);
-      }
+  const onMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (isBrushPainting.current) {
+      const world = eventToWorld(e.clientX, e.clientY);
+      if (world) { const hex = findHexAtPoint(world.x, world.y); if (hex) paintHexWithBrush(hex); }
       return;
     }
-
-    // Drag select
     if (isDragSelecting.current && (e.ctrlKey || e.metaKey)) {
-      const svgPoint = mouseToSvg(e);
-      if (svgPoint) {
-        const hex = findHexAtPoint(svgPoint.x, svgPoint.y);
+      const world = eventToWorld(e.clientX, e.clientY);
+      if (world) {
+        const hex = findHexAtPoint(world.x, world.y);
         if (hex) {
-          setSelectedMultiple(prev => {
-            if (prev.has(hex.id)) return prev;
-            const newSet = new Set(prev);
-            newSet.add(hex.id);
-            return newSet;
-          });
+          setSelectedMultiple(prev => { if (prev.has(hex.id)) return prev; const s = new Set(prev); s.add(hex.id); return s; });
           setSelected(hex);
         }
       }
       return;
     }
-
     if (!isPanning.current) return;
-    setOffset({
-      x: e.clientX - start.current.x,
-      y: e.clientY - start.current.y,
-    });
+    setOffset({ x: e.clientX - start.current.x, y: e.clientY - start.current.y });
   };
 
   const onMouseUp = () => {
-    isPanning.current = false;
-    isDragSelecting.current = false;
-    isBrushPainting.current = false;
+    if (isBrushPainting.current) {
+      if (paintedInStroke.current.size === 0) {
+        historyRef.current.pop(); // nothing changed -> drop the undo entry
+        setHistoryVersion(v => v + 1);
+      } else {
+        // commit the in-place stroke to React state (inspector / export / draw deps)
+        setData(prev => (prev ? { ...prev, map: [...prev.map] } : prev));
+        setSelected(prev => {
+          if (!prev) return prev;
+          const h = dataRef.current?.map.find(m => m.id === prev.id);
+          return h ? { ...h } : prev;
+        });
+      }
+    }
+    isPanning.current = false; isDragSelecting.current = false; isBrushPainting.current = false;
     paintedInStroke.current.clear();
   };
 
-  // JSX
+  // wheel: tier on selection (select mode), otherwise zoom.
+  // Zoom is coalesced to one state update per animation frame so fast wheel
+  // streams don't trigger a redraw per event.
+  useEffect(() => {
+    const c = canvasRef.current;
+    if (!c) return;
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const hasSelection = selectedRef.current || selectedMultipleRef.current.size > 0;
+      if (hasSelection && editModeRef.current === 'select') {
+        const delta = e.deltaY > 0 ? -1 : 1;
+        const base = selectedRef.current?.tier ?? 0;
+        updateHexRef.current('tier', Math.max(0, Math.min(3, base + delta)));
+        return;
+      }
+      const baseScale = pendingScaleRef.current ?? scaleRef.current;
+      pendingScaleRef.current = Math.max(0.3, Math.min(5, baseScale * (e.deltaY < 0 ? 1.1 : 0.9)));
+      if (!wheelRafRef.current) {
+        wheelRafRef.current = requestAnimationFrame(() => {
+          wheelRafRef.current = 0;
+          const v = pendingScaleRef.current;
+          pendingScaleRef.current = null;
+          if (v != null) setScale(v);
+        });
+      }
+    };
+    c.addEventListener('wheel', handleWheel, { passive: false });
+    return () => {
+      c.removeEventListener('wheel', handleWheel);
+      if (wheelRafRef.current) cancelAnimationFrame(wheelRafRef.current);
+    };
+  }, []);
+
+  // ---- canvas size ----------------------------------------------------------
+  useEffect(() => {
+    const c = canvasRef.current;
+    if (!c) return;
+    const measure = () => { const r = c.getBoundingClientRect(); setViewSize({ w: r.width, h: r.height }); };
+    const ro = new ResizeObserver(measure);
+    ro.observe(c);
+    measure();
+    return () => ro.disconnect();
+  }, []);
+
+  // ---- render loop ----------------------------------------------------------
+  const draw = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !data || viewSize.w === 0 || viewSize.h === 0) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const W = viewSize.w, H = viewSize.h;
+    if (canvas.width !== Math.round(W * dpr)) canvas.width = Math.round(W * dpr);
+    if (canvas.height !== Math.round(H * dpr)) canvas.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    const eff = fitScale * scale;
+    const s = sizePx * eff;                    // hex radius on screen
+    const tierH = sizePx * 0.5 * eff;          // elevation per tier on screen
+    const orientation = data.orientation;
+
+    const order = isometric
+      ? [...data.map].sort((a, b) => (a.r - a.tier * 0.5) - (b.r - b.tier * 0.5))
+      : data.map;
+
+    // glow pass (lava + goal)
+    for (const hex of data.map) {
+      const tree = treeMap.has(`${hex.q},${hex.r}`);
+      if (hex.terrain !== 'lava' && !tree) continue;
+      const p = axialToPixel(hex.q, hex.r, sizePx, orientation, rect, stagger, mirror, maxR);
+      const sc = worldToScreen(p.x, p.y);
+      const cy = sc.y - (isometric ? hex.tier * tierH : 0);
+      if (sc.x < -s * 2 || sc.x > W + s * 2 || cy < -s * 2 || cy > H + s * 2) continue;
+      const g = ctx.createRadialGradient(sc.x, cy, 0, sc.x, cy, s * 1.6);
+      g.addColorStop(0, tree ? 'rgba(110,169,63,0.5)' : 'rgba(255,110,30,0.42)');
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(sc.x, cy, s * 1.6, 0, Math.PI * 2); ctx.fill();
+    }
+
+    const selId = selected?.id;
+    const multi = selectedMultiple;
+
+    for (const hex of order) {
+      const p = axialToPixel(hex.q, hex.r, sizePx, orientation, rect, stagger, mirror, maxR);
+      const sc = worldToScreen(p.x, p.y);
+      const cy = sc.y - (isometric ? hex.tier * tierH : 0);
+      if (sc.x < -s * 2 || sc.x > W + s * 2 || cy < -s * 2 || cy > H + s * 2) continue;
+
+      const T = TERRAIN[hex.terrain] ?? TERRAIN.grass;
+
+      // elevation walls
+      if (isometric && hex.tier > 0) {
+        const top = hexCorners(sc.x, cy, s, orientation);
+        const bot = hexCorners(sc.x, sc.y, s, orientation);
+        const edges = [2, 3, 4];
+        const shades = [0.5, 0.4, 0.45];
+        edges.forEach((idx, i) => {
+          const n = (idx + 1) % 6;
+          ctx.beginPath();
+          ctx.moveTo(top[idx][0], top[idx][1]);
+          ctx.lineTo(top[n][0], top[n][1]);
+          ctx.lineTo(bot[n][0], bot[n][1]);
+          ctx.lineTo(bot[idx][0], bot[idx][1]);
+          ctx.closePath();
+          ctx.fillStyle = darkenColor(T.fill, shades[i]);
+          ctx.fill();
+          ctx.lineWidth = Math.max(0.5, s * 0.02);
+          ctx.strokeStyle = 'rgba(12,15,21,0.55)';
+          ctx.stroke();
+        });
+      }
+
+      // top face
+      const pts = hexCorners(sc.x, cy, s * 0.97, orientation);
+      ctx.beginPath();
+      pts.forEach((pt, i) => (i ? ctx.lineTo(pt[0], pt[1]) : ctx.moveTo(pt[0], pt[1])));
+      ctx.closePath();
+      const g = ctx.createLinearGradient(sc.x, cy - s, sc.x, cy + s);
+      g.addColorStop(0, T.top); g.addColorStop(0.55, T.fill); g.addColorStop(1, T.bot);
+      ctx.fillStyle = g; ctx.fill();
+      ctx.lineWidth = Math.max(1, s * 0.05);
+      ctx.strokeStyle = 'rgba(12,15,21,0.45)';
+      ctx.stroke();
+
+      // tier darkening
+      if (hex.tier >= 1) {
+        ctx.save(); ctx.clip();
+        ctx.fillStyle = hex.tier >= 2 ? 'rgba(20,24,31,0.40)' : 'rgba(20,24,31,0.22)';
+        ctx.fillRect(sc.x - s, cy - s, 2 * s, 2 * s);
+        ctx.restore();
+      }
+
+      const key = `${hex.q},${hex.r}`;
+      const isSpawn = spawnSet.has(key);
+      const isTree = treeMap.has(key);
+
+      // marker footprint aura (rings around spawns / world trees)
+      const aura = auraMap.get(key);
+      if (aura && !isSpawn && !isTree) {
+        ctx.beginPath();
+        pts.forEach((pt, i) => (i ? ctx.lineTo(pt[0], pt[1]) : ctx.moveTo(pt[0], pt[1])));
+        ctx.closePath();
+        ctx.fillStyle = aura === 'spawn' ? 'rgba(211,73,27,0.30)'
+          : aura === 'tree1' ? 'rgba(110,169,63,0.62)' : 'rgba(110,169,63,0.40)';
+        ctx.fill();
+        ctx.lineWidth = Math.max(1.5, s * 0.07);
+        ctx.strokeStyle = aura === 'spawn' ? 'rgba(211,73,27,0.7)'
+          : aura === 'tree1' ? 'rgba(149,209,79,0.95)' : 'rgba(110,169,63,0.75)';
+        ctx.stroke();
+      }
+
+      // markers
+      if (isTree) {
+        const ip = hexCorners(sc.x, cy, s * 0.5, orientation);
+        ctx.beginPath(); ip.forEach((pt, i) => (i ? ctx.lineTo(pt[0], pt[1]) : ctx.moveTo(pt[0], pt[1]))); ctx.closePath();
+        ctx.fillStyle = '#ecc846'; ctx.fill();
+        ctx.lineWidth = Math.max(1, s * 0.05); ctx.strokeStyle = '#14181f'; ctx.stroke();
+        if (worldTrees.length > 1) {
+          ctx.fillStyle = '#14181f'; ctx.font = `bold ${Math.round(s * 0.5)}px var(--font-ui, sans-serif)`;
+          ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+          ctx.fillText(String(treeMap.get(`${hex.q},${hex.r}`)), sc.x, cy);
+        }
+      } else if (isSpawn) {
+        ctx.beginPath(); ctx.arc(sc.x, cy, s * 0.34, 0, Math.PI * 2);
+        ctx.fillStyle = '#d3491b'; ctx.fill();
+        ctx.lineWidth = Math.max(1.5, s * 0.07); ctx.strokeStyle = '#fff'; ctx.stroke();
+      }
+
+      // selection / multi-select outline
+      const isSel = hex.id === selId;
+      const isMulti = multi.has(hex.id);
+      if (isSel || isMulti) {
+        ctx.save();
+        ctx.beginPath();
+        pts.forEach((pt, i) => (i ? ctx.lineTo(pt[0], pt[1]) : ctx.moveTo(pt[0], pt[1])));
+        ctx.closePath();
+        if (isSel) { ctx.shadowColor = 'rgba(246,217,112,0.85)'; ctx.shadowBlur = 14; ctx.strokeStyle = '#f6d970'; ctx.lineWidth = Math.max(2, s * 0.1); }
+        else { ctx.strokeStyle = '#ecc846'; ctx.lineWidth = Math.max(1.5, s * 0.06); }
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+  }, [data, viewSize, sizePx, scale, fitScale, isometric, rect, stagger, mirror, maxR,
+    spawnSet, treeMap, auraMap, worldTrees, selected, selectedMultiple, worldToScreen]);
+
+  drawRef.current = draw;
+
+  // redraw whenever anything visual changes
+  useEffect(() => { draw(); }, [draw]);
+
+  // ---- inspector helpers ----------------------------------------------------
+  const choosePaletteTerrain = (t: string) => setBrushTerrain(t);
+
+  // ---- submit to wtd-analytics ----
+  const submitStats = useMemo(() => ({
+    hexes: data?.map.length ?? 0,
+    spawns: spawnPoints.length,
+    goals: worldTrees.length,
+    biomes: data ? new Set(data.map.map(h => h.terrain)).size : 0,
+  }), [data, spawnPoints, worldTrees]);
+
+  const openSubmit = () => {
+    if (!data) return;
+    setSubName(fileName.replace(/\.[^.]+$/, '').toUpperCase());
+    setSubStatus('idle');
+    setSubMsg('');
+    setSubmitOpen(true);
+  };
+
+  const handleSubmit = async () => {
+    const exportData = getExportData();
+    if (!exportData) return;
+    setSubStatus('sending');
+    setSubMsg('Sending…');
+    try {
+      const res = await fetch(`${ANALYTICS_BASE}/api/maps`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Submit-Token': SUBMIT_TOKEN },
+        body: JSON.stringify({ name: subName, biome: subBiome, submittedBy: subBy, notes: subNotes, map: exportData }),
+      });
+      if (res.status === 401) {
+        setSubStatus('error');
+        setSubMsg('Submit rejected (token not configured on server).');
+        return;
+      }
+      if (res.status === 429) {
+        setSubStatus('error');
+        setSubMsg('Daily submit limit reached. Try again tomorrow.');
+        return;
+      }
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        setSubStatus('error');
+        setSubMsg(body?.error ? `Failed: ${body.error}` : `Failed (HTTP ${res.status})`);
+        return;
+      }
+      setSubStatus('ok');
+      setSubMsg('Submitted ✓');
+      setTimeout(() => { setSubmitOpen(false); setSubStatus('idle'); setSubMsg(''); }, 1300);
+    } catch {
+      setSubStatus('error');
+      setSubMsg('Could not reach server (network/CORS).');
+    }
+  };
+  const cycleSelectedTerrain = () => {
+    if (!selected) return;
+    const i = TERRAIN_ORDER.indexOf(selected.terrain);
+    updateHex('terrain', TERRAIN_ORDER[(i + 1) % TERRAIN_ORDER.length]);
+  };
+
+  const zoomPct = Math.round(scale * 100);
+  const crumbName = fileName.replace(/\.[^.]+$/, '').toUpperCase();
+  const showSelected = !!selected && editMode === 'select';
+  const paintCursor = editMode === 'brush';
+
+  // ==========================================================================
   return (
-    <div className="grid grid-cols-1 md:grid-cols-[4fr_2fr] gap-4 p-4 font-sans">
-      {/* Canvas */}
-      <Card className="overflow-auto shadow-xl min-h-[60vh]">
-        <CardContent className="relative">
-          {data ? (
-            <svg
-              ref={svgRef}
-              viewBox={`0 0 ${bounds.w} ${bounds.h}`}
-              width="100%"
-              height="100%"
-              className="select-none cursor-grab"
-              style={isometric ? {
-                transform: `perspective(1500px) rotateX(${tiltAngle}deg)`,
-                transformOrigin: 'center top',
-                marginTop: '100px',
-              } : undefined}
-              onMouseDown={onMouseDown}
-              onMouseMove={onMouseMove}
-              onMouseUp={onMouseUp}
-              onMouseLeave={onMouseUp}
-            >
-              <g transform={`translate(${offset.x + bounds.w / 2 * (1 - scale)} ${offset.y + bounds.h / 2 * (1 - scale)}) scale(${scale})`}>
-                {/* Sort hexes for proper z-ordering in isometric view */}
-                {[...data.map]
-                  .sort((a, b) => {
-                    if (!isometric) return 0;
-                    // Sort by effective visual position (row adjusted for tier height)
-                    // Higher tier hexes move backward (up), so subtract tier contribution
-                    // This ensures proper layering: back hexes render first, elevated hexes
-                    // render in their visual position rather than logical row
-                    const tierFactor = 0.5; // matches tierHeight / sizePx
-                    const aEffective = a.r - a.tier * tierFactor;
-                    const bEffective = b.r - b.tier * tierFactor;
-                    return aEffective - bEffective;
-                  })
-                  .map(hex => {
-                  const { x, y } = axialToPixel(
-                    hex.q,
-                    hex.r,
-                    sizePx,
-                    data.orientation,
-                    rect,
-                    stagger,
-                    mirror,
-                    maxR,
-                  );
-                  const isSpawn = isSpawnPoint(hex.q, hex.r);
-                  const isTree = isWorldTree(hex.q, hex.r);
-                  const isSelected = selected?.id === hex.id;
-                  const isMultiSelected = selectedMultiple.has(hex.id);
-                  // Vertical offset for isometric view based on tier (negative Y = up/backward in tilted view)
-                  const tierHeight = sizePx * 0.5;
-                  const tierOffset = isometric ? -hex.tier * tierHeight : 0;
-                  const hexColor = shadeColour(hex, minH, maxH);
-                  const walls = isometric && hex.tier > 0 ? getHexWalls(x, y, sizePx, data.orientation, hex.tier * tierHeight) : [];
-                  return (
-                    <g
-                      key={hex.id}
-                      onClick={(e) => handleHexClick(hex, e)}
-                      className="cursor-pointer"
-                    >
-                      {/* Walls for raised hexes - rendered at base, connecting to elevated top */}
-                      {walls.map((wall, i) => (
-                        <polygon
-                          key={`wall-${i}`}
-                          points={wall.points}
-                          fill={darkenColor(hexColor, wall.shade)}
-                          stroke="#333"
-                          strokeWidth={0.5}
-                        />
-                      ))}
-                      {/* Top face */}
-                      <g transform={`translate(0, ${tierOffset})`}>
-                        <motion.polygon
-                          points={hexPoints(x, y, sizePx, data.orientation)}
-                          initial={{ scale: 0 }}
-                          animate={{ scale: 1 }}
-                          transition={{ type: 'spring', stiffness: 120 }}
-                          stroke={isTree ? '#22c55e' : isSpawn ? '#ff4444' : isMultiSelected ? '#3b82f6' : '#333'}
-                          strokeWidth={isTree ? 4 : isSpawn ? 4 : isMultiSelected ? 3 : 1.2}
-                          fill={hexColor}
-                          opacity={isSelected || isMultiSelected ? 0.7 : 1}
-                        />
-                      </g>
-                      {/* World tree marker */}
-                      {isTree && (
-                        <g transform={`translate(0, ${tierOffset})`}>
-                          <circle
-                            cx={x}
-                            cy={y}
-                            r={sizePx * 0.35}
-                            fill="#22c55e"
-                            opacity={0.9}
-                          />
-                          <text
-                            x={x}
-                            y={y}
-                            textAnchor="middle"
-                            dominantBaseline="central"
-                            fill="white"
-                            fontSize={sizePx * 0.35}
-                            fontWeight="bold"
-                          >
-                            {worldTrees.length > 1 ? `T${getWorldTreeAt(hex.q, hex.r)?.treeId ?? ''}` : 'T'}
-                          </text>
-                        </g>
-                      )}
-                      {/* Spawn point marker */}
-                      {isSpawn && (
-                        <g transform={`translate(0, ${tierOffset})`}>
-                          <circle
-                            cx={x}
-                            cy={y}
-                            r={sizePx * 0.35}
-                            fill="#ff4444"
-                            opacity={0.8}
-                          />
-                          <text
-                            x={x}
-                            y={y}
-                            textAnchor="middle"
-                            dominantBaseline="central"
-                            fill="white"
-                            fontSize={sizePx * 0.4}
-                            fontWeight="bold"
-                          >
-                            S
-                          </text>
-                        </g>
-                      )}
-                    </g>
-                  );
-                })}
-              </g>
-            </svg>
-          ) : (
-            <div className="flex h-[60vh] items-center justify-center text-gray-400">
-              Import a map to get started
-            </div>
-          )}
-        </CardContent>
-      </Card>
+    <div className="hme">
+      {/* ============ TOP BAR ============ */}
+      <header className="topbar">
+        <div className="brandmark">
+          <div className="hex"><Hexagon /></div>
+          <div className="brand-text">
+            <span className="kicker">WORLD TREE DEFENDER</span>
+            <span className="title">Hex Map Editor</span>
+          </div>
+        </div>
+        <div className="mapcrumb"><span className="dot" /> MAP <b>{crumbName || '—'}</b></div>
+        <div className="spacer" />
+        <button className="btn ghost" onClick={handleImportClick}><Upload /> Import</button>
+        <button className={`btn${canUndo ? '' : ' disabled'}`} onClick={undo}><Undo2 /> Undo</button>
+        <button className={`btn${data ? '' : ' disabled'}`} onClick={handleSave}><Save /> Save</button>
+        <button className={`btn${data ? '' : ' disabled'}`} onClick={handleExport}><CopyPlus /> Save As</button>
+        <button className={`btn primary${data ? '' : ' disabled'}`} onClick={openSubmit}><Send /> Submit</button>
+        <input ref={fileRef} type="file" accept="application/json" style={{ display: 'none' }} onChange={handleImport} />
+      </header>
 
-      {/* Sidebar */}
-      <div className="flex flex-col gap-4 rounded-2xl bg-white p-4 shadow-lg">
-        <h2 className="text-xl font-semibold">Hex Map Editor</h2>
-        <div className="flex flex-wrap gap-2">
-          <Button onClick={handleImportClick}>Import</Button>
-          <Button variant="secondary" disabled={!data} onClick={handleSave}>
-            Save
-          </Button>
-          <Button variant="outline" disabled={!data} onClick={handleExport}>
-            Save As
-          </Button>
+      <div className="hme-body">
+        {/* ============ LEFT TOOL RAIL ============ */}
+        <nav className="rail">
+          <button className={`tool${editMode === 'select' ? ' active' : ''}`} title="Select" onClick={() => setEditMode('select')}><MousePointer2 /></button>
+          <button className={`tool${editMode === 'brush' ? ' active' : ''}`} title="Brush / paint terrain" onClick={() => setEditMode('brush')}><Brush /></button>
+          <button className={`tool${editMode === 'spawn' ? ' active' : ''}`} title="Spawn markers" onClick={() => setEditMode('spawn')}>
+            <MapPin />{spawnPoints.length > 0 && <span className="badge">{spawnPoints.length}</span>}
+          </button>
+          <button className={`tool${editMode === 'goal' ? ' active' : ''}`} title="Goal / World Trees" onClick={() => setEditMode('goal')}>
+            <TreePine />{worldTrees.length > 0 && <span className="badge canopy">{worldTrees.length}</span>}
+          </button>
+        </nav>
+
+        {/* ============ CANVAS STAGE ============ */}
+        <div className="stage">
+          <canvas
+            ref={canvasRef}
+            className="map"
+            style={{ cursor: paintCursor ? 'crosshair' : 'grab' }}
+            onMouseDown={onMouseDown}
+            onMouseMove={onMouseMove}
+            onMouseUp={onMouseUp}
+            onMouseLeave={onMouseUp}
+          />
+          {!data && <div className="empty">Import a map to get started</div>}
+
+          {/* floating view controls */}
+          <div className="float viewbar">
+            <button className="icon-btn" title="Zoom out" onClick={() => setScale(s => Math.max(0.3, s * 0.85))}><Minus /></button>
+            <div className="zoomval">{zoomPct}%</div>
+            <button className="icon-btn" title="Zoom in" onClick={() => setScale(s => Math.min(5, s * 1.18))}><Plus /></button>
+            <div className="vsep" />
+            <button className="icon-btn" title="Reset view" onClick={() => { setScale(1); setOffset({ x: 0, y: 0 }); }}><Maximize /></button>
+            <div className="vsep" />
+            <div className="seg">
+              <button className={isometric ? '' : 'on'} onClick={() => setIsometric(false)}>2D</button>
+              <button className={isometric ? 'on' : ''} onClick={() => setIsometric(true)}><Box style={{ width: 13, height: 13, verticalAlign: '-2px', marginRight: 4 }} />3D</button>
+            </div>
+          </div>
         </div>
 
-        {/* Zoom Controls */}
-        <div className="flex items-center gap-2 mt-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setScale(s => Math.max(0.3, s * 0.8))}
-            disabled={!data}
-          >
-            -
-          </Button>
-          <span className="text-sm min-w-[60px] text-center">{Math.round(scale * 100)}%</span>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setScale(s => Math.min(4, s * 1.25))}
-            disabled={!data}
-          >
-            +
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => {
-              setScale(1);
-              setOffset({ x: 0, y: 0 });
-            }}
-            disabled={!data}
-          >
-            Reset View
-          </Button>
-          <Button
-            variant={isometric ? 'default' : 'outline'}
-            size="sm"
-            onClick={() => setIsometric(!isometric)}
-            disabled={!data}
-            className={isometric ? 'bg-purple-600 hover:bg-purple-700' : ''}
-          >
-            {isometric ? '3D' : '2D'}
-          </Button>
-        </div>
-
-        {/* Tilt Angle Slider (only when 3D is enabled) */}
-        {isometric && data && (
-          <div className="flex items-center gap-2 mt-2">
-            <span className="text-xs text-gray-500">Tilt:</span>
-            <input
-              type="range"
-              min="20"
-              max="70"
-              value={tiltAngle}
-              onChange={(e) => setTiltAngle(Number(e.target.value))}
-              className="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
-            />
-            <span className="text-xs text-gray-500 min-w-[30px]">{tiltAngle}°</span>
-          </div>
-        )}
-
-        {/* Edit Mode Toggle */}
-        {data && (
-          <div className="flex gap-2 mt-2 flex-wrap">
-            <Button
-              variant={editMode === 'terrain' ? 'default' : 'outline'}
-              onClick={() => setEditMode('terrain')}
-              className="flex-1"
-            >
-              🎨 Terrain
-            </Button>
-            <Button
-              variant={editMode === 'spawn' ? 'default' : 'outline'}
-              onClick={() => setEditMode('spawn')}
-              className="flex-1"
-              style={editMode === 'spawn' ? { backgroundColor: '#ff4444' } : {}}
-            >
-              📍 Spawn ({spawnPoints.length})
-            </Button>
-            <Button
-              variant={editMode === 'goal' ? 'default' : 'outline'}
-              onClick={() => setEditMode('goal')}
-              className="flex-1"
-              style={editMode === 'goal' ? { backgroundColor: '#22c55e' } : {}}
-            >
-              🌳 Trees ({worldTrees.length})
-            </Button>
-          </div>
-        )}
-
-        {/* Brush Tool */}
-        {data && editMode === 'terrain' && (
-          <div className="mt-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
-            <div className="flex items-center justify-between mb-2">
-              <h3 className="text-sm font-medium text-blue-700">Brush Tool</h3>
-              <Button
-                size="sm"
-                variant={brushEnabled ? 'default' : 'outline'}
-                onClick={() => setBrushEnabled(!brushEnabled)}
-                className={brushEnabled ? 'bg-blue-600 hover:bg-blue-700' : ''}
-              >
-                {brushEnabled ? '🖌️ On' : '🖌️ Off'}
-              </Button>
-            </div>
-            {brushEnabled && (
-              <div className="space-y-2">
-                <div>
-                  <Label className="text-xs text-blue-600">Terrain</Label>
-                  <Select value={brushTerrain} onValueChange={setBrushTerrain}>
-                    <SelectTrigger className="h-8">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {Object.keys(TERRAIN_COLOURS).map(t => (
-                        <SelectItem key={t} value={t}>
-                          <div className="flex items-center gap-2">
-                            <div
-                              className="w-3 h-3 rounded"
-                              style={{ backgroundColor: TERRAIN_COLOURS[t] }}
-                            />
-                            {t}
-                          </div>
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
+        {/* ============ RIGHT INSPECTOR ============ */}
+        <aside className="inspector">
+          {/* BRUSH + TERRAIN PALETTE — only while the Brush tool is active */}
+          {editMode === 'brush' && (
+            <>
+              <section className="panel hero">
+                <div className="phead">
+                  <div className="ico"><Brush /></div>
+                  <h3>Brush Tool</h3>
                 </div>
-                <div>
-                  <Label className="text-xs text-blue-600">Tier</Label>
-                  <div className="flex items-center gap-2">
+                <div className="pbody">
+                  <span className="label">Tier</span>
+                  <div className="tierseg">
                     {[0, 1, 2, 3].map(t => (
-                      <Button
-                        key={t}
-                        size="sm"
-                        variant={brushTier === t ? 'default' : 'outline'}
-                        onClick={() => setBrushTier(t)}
-                        className={`flex-1 ${brushTier === t ? 'bg-blue-600' : ''}`}
-                      >
-                        {t}
-                      </Button>
+                      <div key={t} className={`tier${brushTier === t ? ' on' : ''}`} onClick={() => setBrushTier(t)}>{t}</div>
+                    ))}
+                  </div>
+                  <div className="hint sun">Click &amp; drag on the map to paint</div>
+                </div>
+              </section>
+
+              <section className="panel">
+                <div className="phead"><div className="ico"><Palette /></div><h3>Terrain Palette</h3></div>
+                <div className="pbody">
+                  <div className="swgrid">
+                    {TERRAIN_ORDER.map(t => (
+                      <div key={t} className={`sw-item${brushTerrain === t ? ' sel' : ''}`} onClick={() => choosePaletteTerrain(t)}>
+                        <span className="chip" style={{ background: TERRAIN[t].fill }} />
+                        <span className="nm">{t}</span>
+                      </div>
                     ))}
                   </div>
                 </div>
-                <p className="text-xs text-blue-400 italic">Click and drag to paint</p>
+              </section>
+            </>
+          )}
+
+          {/* SPAWN / GOAL LIST */}
+          {(editMode === 'spawn' || editMode === 'goal') && (
+            <section className="panel">
+              <div className="phead">
+                <div className="ico">{editMode === 'spawn' ? <MapPin /> : <TreePine />}</div>
+                <h3>{editMode === 'spawn' ? 'Spawn Points' : 'World Trees'}</h3>
               </div>
-            )}
-          </div>
-        )}
-
-        <Input ref={fileRef} type="file" accept="application/json" className="hidden" onChange={handleImport} />
-
-        {/* Legend */}
-        <div className="mt-4 p-3 bg-gray-50 border border-gray-200 rounded-lg">
-          <h3 className="text-sm font-medium text-gray-700 mb-2">Terrain</h3>
-          <div className="grid grid-cols-2 gap-1.5">
-            {Object.entries(TERRAIN_COLOURS).map(([name, color]) => (
-              <div key={name} className="flex items-center gap-2">
-                <div
-                  className="w-4 h-4 rounded border border-gray-300"
-                  style={{ backgroundColor: color }}
-                />
-                <span className="text-xs text-gray-600 capitalize">{name}</span>
+              <div className="pbody">
+                <div className="hint" style={{ marginTop: 0 }}>
+                  {editMode === 'spawn' ? 'Click hexes to add / remove spawn points.' : 'Click hexes to add / remove goals. Multiple = multi-lane.'}
+                </div>
+                {editMode === 'spawn' ? (
+                  spawnPoints.length ? (
+                    <div className="mlist">
+                      {spawnPoints.map((sp, i) => (
+                        <div key={i} className="mitem"><span>({sp.q}, {sp.r})</span><button onClick={() => toggleSpawnPoint(sp.q, sp.r)} title="Remove">✕</button></div>
+                      ))}
+                    </div>
+                  ) : <div className="hint">No spawn points yet.</div>
+                ) : (
+                  worldTrees.length ? (
+                    <div className="mlist">
+                      {worldTrees.map(tree => (
+                        <div key={tree.treeId} className="mitem"><span>Tree {tree.treeId}: ({tree.q}, {tree.r})</span><button onClick={() => toggleWorldTreeAt(tree.q, tree.r)} title="Remove">✕</button></div>
+                      ))}
+                    </div>
+                  ) : <div className="hint">No trees set yet.</div>
+                )}
               </div>
-            ))}
-          </div>
+            </section>
+          )}
 
-          <h3 className="text-sm font-medium text-gray-700 mt-3 mb-2">Markers</h3>
-          <div className="grid grid-cols-2 gap-1.5">
-            <div className="flex items-center gap-2">
-              <div className="w-4 h-4 rounded-full bg-red-500 border-2 border-red-700" />
-              <span className="text-xs text-gray-600">Spawn</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <div className="w-4 h-4 rounded-full bg-green-500 border-2 border-green-700" />
-              <span className="text-xs text-gray-600">Goal</span>
-            </div>
-          </div>
-
-          <h3 className="text-sm font-medium text-gray-700 mt-3 mb-2">Tiers</h3>
-          <div className="space-y-1">
-            <div className="flex items-center gap-2">
-              <span className="w-4 h-4 flex items-center justify-center text-xs font-bold bg-white border border-gray-300 rounded">0</span>
-              <span className="text-xs text-gray-600">Walkable / Road (not buildable)</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="w-4 h-4 flex items-center justify-center text-xs font-bold bg-white border border-gray-300 rounded">1</span>
-              <span className="text-xs text-gray-600">Normal wall</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="w-4 h-4 flex items-center justify-center text-xs font-bold bg-white border border-gray-300 rounded">2</span>
-              <span className="text-xs text-gray-600">Unmodifiable wall</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="w-4 h-4 flex items-center justify-center text-xs font-bold bg-white border border-gray-300 rounded">3</span>
-              <span className="text-xs text-gray-600">Out of bounds</span>
-            </div>
-          </div>
-
-          <p className="text-xs text-gray-400 mt-3 italic">Ctrl+click or Ctrl+drag to multi-select</p>
-        </div>
-
-        {/* Spawn mode info panel */}
-        {editMode === 'spawn' && (
-          <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-lg">
-            <h3 className="text-lg font-medium text-red-700">Spawn Point Mode</h3>
-            <p className="text-sm text-red-600 mt-1">Click hexes to add/remove spawn points</p>
-            {spawnPoints.length > 0 && (
-              <div className="mt-2">
-                <p className="text-sm font-medium text-red-700">Current spawn points:</p>
-                <ul className="text-xs text-red-600 mt-1 max-h-32 overflow-y-auto">
-                  {spawnPoints.map((sp, i) => (
-                    <li key={i} className="flex justify-between items-center py-0.5">
-                      <span>({sp.q}, {sp.r})</span>
-                      <button
-                        onClick={() => toggleSpawnPoint(sp.q, sp.r)}
-                        className="text-red-400 hover:text-red-600 text-xs"
-                      >
-                        ✕
-                      </button>
-                    </li>
-                  ))}
-                </ul>
+          {/* LEGEND */}
+          <section className="panel">
+            <div className="phead"><div className="ico"><List /></div><h3>Legend</h3></div>
+            <div className="pbody">
+              <div className="subhead">Markers</div>
+              <div className="legend">
+                <div className="lrow"><span className="dotm" style={{ background: '#d3491b' }} /> Spawn</div>
+                <div className="lrow"><span className="dotm" style={{ background: '#6ea93f' }} /> Goal</div>
               </div>
-            )}
-            {spawnPoints.length === 0 && (
-              <p className="text-xs text-red-400 mt-2 italic">No spawn points yet</p>
-            )}
-          </div>
-        )}
-
-        {/* Goal mode info panel */}
-        {editMode === 'goal' && (
-          <div className="mt-4 p-3 bg-green-50 border border-green-200 rounded-lg">
-            <h3 className="text-lg font-medium text-green-700">World Trees Mode</h3>
-            <p className="text-sm text-green-600 mt-1">Click hexes to add/remove World Trees (goals)</p>
-            <p className="text-xs text-green-500 mt-1">Multiple trees = multi-lane mode</p>
-            {worldTrees.length > 0 ? (
-              <div className="mt-2">
-                <p className="text-sm font-medium text-green-700">Current trees:</p>
-                <ul className="text-xs text-green-600 mt-1 max-h-32 overflow-y-auto">
-                  {worldTrees.map((tree) => (
-                    <li key={tree.treeId} className="flex justify-between items-center py-0.5">
-                      <span>Tree {tree.treeId}: ({tree.q}, {tree.r})</span>
-                      <button
-                        onClick={() => toggleWorldTreeAt(tree.q, tree.r)}
-                        className="text-green-400 hover:text-green-600 text-xs"
-                      >
-                        ✕
-                      </button>
-                    </li>
-                  ))}
-                </ul>
+              <div className="subhead">Tiers</div>
+              <div className="legend">
+                <div className="lrow"><span className="tnum">0</span> Walkable / road</div>
+                <div className="lrow"><span className="tnum">1</span> Normal wall</div>
+                <div className="lrow"><span className="tnum">2</span> Unmodifiable</div>
+                <div className="lrow"><span className="tnum">3</span> Out of bounds</div>
               </div>
-            ) : (
-              <p className="text-xs text-green-400 mt-2 italic">No trees set yet</p>
-            )}
-          </div>
-        )}
+              <div className="hint">Ctrl+click or Ctrl+drag to multi-select.</div>
+            </div>
+          </section>
 
-        {selected && editMode === 'terrain' ? (
-          <>
-            <h3 className="text-lg font-medium mt-4">Selected Hex: {selected.id}</h3>
-            <div className="space-y-3">
-              <div>
-                <Label>Terrain</Label>
-                <Select value={selected.terrain} onValueChange={v => updateHex('terrain', v)}>
-                  <SelectTrigger>
-                    <SelectValue placeholder="Terrain" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {Object.keys(TERRAIN_COLOURS).map(t => (
-                      <SelectItem key={t} value={t}>
-                        {t}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div>
-                <Label>Tier</Label>
-                <div
-                  className="flex items-center gap-2 p-2 border rounded-md cursor-ns-resize select-none"
-                  onWheel={e => {
-                    e.preventDefault();
-                    const delta = e.deltaY > 0 ? -1 : 1;
-                    const newTier = Math.max(0, Math.min(3, selected.tier + delta));
-                    updateHex('tier', newTier);
-                  }}
-                >
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => updateHex('tier', Math.max(0, selected.tier - 1))}
-                  >
-                    -
-                  </Button>
-                  <span className="text-lg font-medium min-w-[40px] text-center">{selected.tier}</span>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => updateHex('tier', Math.min(3, selected.tier + 1))}
-                  >
-                    +
-                  </Button>
+          {/* SELECTED HEX */}
+          {showSelected && (
+            <section className={`panel${selCollapsed ? ' collapsed' : ''}`}>
+              <div className="phead">
+                <div className="ico"><Hexagon /></div>
+                <h3>Selected Hex</h3>
+                <div className="right selhead">
+                  <span className="id">{selectedMultiple.size > 1 ? `×${selectedMultiple.size}` : selected!.id}</span>
+                  <button className="collapse-btn" title="Hide details" onClick={() => setSelCollapsed(v => !v)}><ChevronUp /></button>
                 </div>
               </div>
-              <div>
-                <Label>Rotation</Label>
-                <div className="flex items-center gap-1 flex-wrap">
-                  <Button
-                    variant={selected.rotation === -1 ? 'default' : 'outline'}
-                    size="sm"
-                    onClick={() => updateHex('rotation', -1)}
-                    className={selected.rotation === -1 ? 'bg-gray-700' : ''}
-                  >
-                    None
-                  </Button>
+              <div className="pbody">
+                <span className="label">Terrain</span>
+                <div className="field" onClick={cycleSelectedTerrain} title="Click to cycle, or pick from the palette">
+                  <span className="sw" style={{ background: terrainFill(selected!.terrain) }} />
+                  <span className="nm">{selected!.terrain}</span>
+                  <span className="chev"><ChevronDown /></span>
+                </div>
+
+                <div className="gap" />
+                <span className="label">Tier</span>
+                <div className="stepper">
+                  <button onClick={() => updateHex('tier', Math.max(0, selected!.tier - 1))}>−</button>
+                  <div className="val">{selected!.tier}</div>
+                  <button onClick={() => updateHex('tier', Math.min(3, selected!.tier + 1))}>+</button>
+                </div>
+
+                <div className="gap" />
+                <span className="label">Rotation</span>
+                <div className="rotrow">
+                  <div className={`rot none${selected!.rotation === -1 ? ' on' : ''}`} onClick={() => updateHex('rotation', -1)}>None</div>
                   {[0, 1, 2, 3, 4, 5].map(r => (
-                    <Button
-                      key={r}
-                      variant={selected.rotation === r ? 'default' : 'outline'}
-                      size="sm"
-                      onClick={() => updateHex('rotation', r)}
-                      className={selected.rotation === r ? 'bg-blue-600' : ''}
-                    >
-                      {r}
-                    </Button>
+                    <div key={r} className={`rot${selected!.rotation === r ? ' on' : ''}`} onClick={() => updateHex('rotation', r)}>{r}</div>
                   ))}
+                </div>
+
+                <div className="gap" />
+                <span className="label">Asset</span>
+                <input className="asset-input" value={selected!.asset} placeholder="asset id…" onChange={e => updateHex('asset', e.target.value)} />
+              </div>
+            </section>
+          )}
+        </aside>
+      </div>
+
+      {/* ============ SUBMIT MODAL ============ */}
+      {submitOpen && data && (
+        <div className="overlay" onMouseDown={e => { if (e.target === e.currentTarget) setSubmitOpen(false); }}>
+          <div className="modal" role="dialog" aria-modal="true">
+            <div className="modal-head">
+              <div className="m-ico"><Send /></div>
+              <div>
+                <h2>Submit Map</h2>
+                <div className="m-sub">Send {subName || '—'} to wtd-analytics</div>
+              </div>
+              <button className="icon-btn" onClick={() => setSubmitOpen(false)}><X /></button>
+            </div>
+            <div className="modal-body">
+              <div className="valrow">
+                <span><b>{submitStats.hexes}</b> Hexes</span>
+                <span><b>{submitStats.spawns}</b> Spawns</span>
+                <span><b>{submitStats.goals}</b> Goals</span>
+                <span><b>{submitStats.biomes}</b> Biomes</span>
+              </div>
+              <div>
+                <span className="label">Map Name</span>
+                <input className="m-input" value={subName} onChange={e => setSubName(e.target.value)} />
+              </div>
+              <div>
+                <span className="label">Biome</span>
+                <div className="m-select">
+                  <select value={subBiome} onChange={e => setSubBiome(e.target.value)}>
+                    {BIOMES.map(b => <option key={b}>{b}</option>)}
+                  </select>
+                  <ChevronDown />
                 </div>
               </div>
               <div>
-                <Label>Asset</Label>
-                <Input value={selected.asset} onChange={e => updateHex('asset', e.target.value)} />
+                <span className="label">Submitted By</span>
+                <input className="m-input" value={subBy} placeholder="Your nickname" onChange={e => setSubBy(e.target.value)} />
+              </div>
+              <div>
+                <span className="label">Patch Notes</span>
+                <textarea className="m-input m-area" value={subNotes} placeholder="What changed in this revision…" onChange={e => setSubNotes(e.target.value)} />
               </div>
             </div>
-          </>
-        ) : editMode === 'terrain' ? (
-          <p className="text-gray-500 mt-4">Click a hex to edit its properties.</p>
-        ) : null}
-      </div>
+            <div className="modal-foot">
+              {subMsg && <span className={`m-msg${subStatus === 'ok' ? ' ok' : subStatus === 'error' ? ' err' : ''}`}>{subMsg}</span>}
+              <button className="btn ghost" onClick={() => setSubmitOpen(false)}>Cancel</button>
+              <button className={`btn primary${subStatus === 'ok' ? ' ok' : ''}`} onClick={handleSubmit} disabled={subStatus === 'sending'}>
+                <Send /> {subStatus === 'sending' ? 'Sending…' : subStatus === 'ok' ? 'Submitted' : 'Submit Map'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

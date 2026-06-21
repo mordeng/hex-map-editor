@@ -32,6 +32,12 @@ jobs:
 
       - name: Build
         run: npm run build
+        env:
+          # Map-submit token baked into the static build (matches MAP_SUBMIT_TOKEN
+          # on wtd-analytics). Falls back to the in-code default if the secret is unset.
+          NEXT_PUBLIC_WTD_SUBMIT_TOKEN: ${{ secrets.NEXT_PUBLIC_WTD_SUBMIT_TOKEN }}
+          # Optional override for the wtd-analytics base URL.
+          NEXT_PUBLIC_WTD_ANALYTICS_BASE: ${{ secrets.NEXT_PUBLIC_WTD_ANALYTICS_BASE }}
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
