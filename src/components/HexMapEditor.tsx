@@ -801,12 +801,14 @@ export default function HexMapEditor() {
       const aura = auraMap.get(key);
       if (aura && !isSpawn && !isTree) {
         tracePath(scx, cy, s);
+        // Tree rings use a bright lime (distinct from grass, which is the same
+        // canopy green) so the footprint reads on grass and every other terrain.
         ctx.fillStyle = aura === 'spawn' ? 'rgba(211,73,27,0.30)'
-          : aura === 'tree1' ? 'rgba(110,169,63,0.62)' : 'rgba(110,169,63,0.40)';
+          : aura === 'tree1' ? 'rgba(190,255,120,0.45)' : 'rgba(190,255,120,0.26)';
         ctx.fill();
-        ctx.lineWidth = Math.max(1.5, s * 0.07);
-        ctx.strokeStyle = aura === 'spawn' ? 'rgba(211,73,27,0.7)'
-          : aura === 'tree1' ? 'rgba(149,209,79,0.95)' : 'rgba(110,169,63,0.75)';
+        ctx.lineWidth = Math.max(1.5, s * 0.08);
+        ctx.strokeStyle = aura === 'spawn' ? 'rgba(255,120,60,0.85)'
+          : aura === 'tree1' ? 'rgba(224,255,150,1)' : 'rgba(200,255,130,0.9)';
         ctx.stroke();
       }
 
