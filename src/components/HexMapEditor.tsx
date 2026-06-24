@@ -314,6 +314,13 @@ export default function HexMapEditor() {
     rafId.current = requestAnimationFrame(() => { rafId.current = null; drawRef.current?.(); });
   }, []);
   useEffect(() => () => { if (rafId.current != null) cancelAnimationFrame(rafId.current); }, []);
+
+  // Offscreen bitmap of the static scene (terrain / glow / markers). It is
+  // re-rendered only when the scene or camera changes — NOT on hover or
+  // selection. Hovering then costs one blit + a few outline strokes instead of
+  // repainting all ~3.6k hexes every frame.
+  const baseCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const baseDirty = useRef(true);
   const lastFileHandle = useRef<FileSystemFileHandle | null>(null);
   const lastFileName = useRef<string>('map.json');
 
@@ -657,6 +664,14 @@ export default function HexMapEditor() {
     return m;
   }, [data]);
 
+  // id -> hex, so the overlay can resolve the handful of highlighted hexes
+  // (hover footprint + selection) without scanning the whole map each frame.
+  const idToHex = useMemo(() => {
+    const m = new Map<string, Hex>();
+    if (data) for (const h of data.map) m.set(h.id, h);
+    return m;
+  }, [data]);
+
   // Hot path: mutate hexes in place and redraw imperatively (no React state
   // churn). The stroke is committed to state once on mouse-up. With a brush
   // radius > 0 the centre hex plus its surrounding ring(s) are painted in one dab.
@@ -678,7 +693,7 @@ export default function HexMapEditor() {
         if (h && paintOne(h)) changed = true;
       }
     }
-    if (changed) scheduleDraw();
+    if (changed) { baseDirty.current = true; scheduleDraw(); } // paint changes the scene -> rebuild base
   }, [brushTerrain, brushTier, brushRadius, hexByCoord, scheduleDraw]);
 
   // Update the brush footprint preview (hex ids under the brush). Redraws only
@@ -832,172 +847,195 @@ export default function HexMapEditor() {
 
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const W = viewSize.w, H = viewSize.h;
-    if (canvas.width !== Math.round(W * dpr)) canvas.width = Math.round(W * dpr);
-    if (canvas.height !== Math.round(H * dpr)) canvas.height = Math.round(H * dpr);
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, W, H);
+    const pxW = Math.round(W * dpr), pxH = Math.round(H * dpr);
+    if (canvas.width !== pxW) canvas.width = pxW;
+    if (canvas.height !== pxH) canvas.height = pxH;
 
+    // ----- shared projection (used by both the base render and the overlay) -----
     const eff = fitScale * scale;
     const s = sizePx * eff;                    // hex radius on screen
     const tierH = sizePx * 0.5 * eff;          // elevation per tier on screen
     const orientation = data.orientation;
     const halfW = bounds.w / 2, halfH = bounds.h / 2;
     const baseX = W / 2 + offset.x, baseY = H / 2 + offset.y;
-
-    // Precompute the 6 corner unit vectors once (constant per orientation) so we
-    // don't call cos/sin for every hex every frame.
     const offDeg = orientation === 'pointy' ? 30 : 0;
     const ux: number[] = [], uy: number[] = [];
     for (let i = 0; i < 6; i++) { const a = ((offDeg + 60 * i) * Math.PI) / 180; ux.push(Math.cos(a)); uy.push(Math.sin(a)); }
-    const tracePath = (cx: number, cy: number, rad: number) => {
-      ctx.beginPath();
-      for (let i = 0; i < 6; i++) { const X = cx + rad * ux[i], Y = cy + rad * uy[i]; if (i) ctx.lineTo(X, Y); else ctx.moveTo(X, Y); }
-      ctx.closePath();
+    const tracePath = (c: CanvasRenderingContext2D, cx: number, cy: number, rad: number) => {
+      c.beginPath();
+      for (let i = 0; i < 6; i++) { const X = cx + rad * ux[i], Y = cy + rad * uy[i]; if (i) c.lineTo(X, Y); else c.moveTo(X, Y); }
+      c.closePath();
     };
-
-    const order = isometric
-      ? [...data.map].sort((a, b) => (a.r - a.tier * 0.5) - (b.r - b.tier * 0.5))
-      : data.map;
-
-    // glow pass (lava + goal). Build the two gradients ONCE per frame at the
-    // origin and reuse them via ctx.translate — previously a fresh
-    // createRadialGradient was allocated per glowing hex every repaint, which
-    // dominated draw cost on lava-heavy maps.
-    const glowR = s * 1.6;
-    const makeGlow = (color: string) => {
-      const g = ctx.createRadialGradient(0, 0, 0, 0, 0, glowR);
-      g.addColorStop(0, color);
-      g.addColorStop(1, 'rgba(0,0,0,0)');
-      return g;
-    };
-    const lavaGlow = makeGlow('rgba(255,110,30,0.42)');
-    const treeGlow = makeGlow('rgba(110,169,63,0.5)');
-    for (const hex of data.map) {
-      const tree = treeMap.has(`${hex.q},${hex.r}`);
-      if (hex.terrain !== 'lava' && !tree) continue;
-      const p = hexCenters.get(hex.id); if (!p) continue;
-      const scx = (p.x - halfW) * eff + baseX;
-      const cy = (p.y - halfH) * eff + baseY - (isometric ? hex.tier * tierH : 0);
-      if (scx < -s * 2 || scx > W + s * 2 || cy < -s * 2 || cy > H + s * 2) continue;
-      ctx.save();
-      ctx.translate(scx, cy);
-      ctx.fillStyle = tree ? treeGlow : lavaGlow;
-      ctx.beginPath(); ctx.arc(0, 0, glowR, 0, Math.PI * 2); ctx.fill();
-      ctx.restore();
-    }
-
-    const selId = selected?.id;
-    const multi = selectedMultiple;
-
-    for (const hex of order) {
-      const p = hexCenters.get(hex.id); if (!p) continue;
+    const screenOf = (hex: Hex) => {
+      const p = hexCenters.get(hex.id); if (!p) return null;
       const scx = (p.x - halfW) * eff + baseX;
       const scyBase = (p.y - halfH) * eff + baseY;
-      const cy = scyBase - (isometric ? hex.tier * tierH : 0);
-      if (scx < -s * 2 || scx > W + s * 2 || cy < -s * 2 || cy > H + s * 2) continue;
+      return { scx, scyBase, cy: scyBase - (isometric ? hex.tier * tierH : 0) };
+    };
 
-      const T = TERRAIN[hex.terrain] ?? TERRAIN.grass;
+    // ----- the static scene, rendered into the offscreen base canvas -----
+    const renderScene = (c: CanvasRenderingContext2D) => {
+      c.setTransform(dpr, 0, 0, dpr, 0, 0);
+      c.clearRect(0, 0, W, H);
 
-      // elevation walls
-      if (isometric && hex.tier > 0) {
-        const edges = [2, 3, 4];
-        const shades = [0.5, 0.4, 0.45];
-        for (let e = 0; e < 3; e++) {
-          const idx = edges[e], n = (idx + 1) % 6;
-          ctx.beginPath();
-          ctx.moveTo(scx + s * ux[idx], cy + s * uy[idx]);
-          ctx.lineTo(scx + s * ux[n], cy + s * uy[n]);
-          ctx.lineTo(scx + s * ux[n], scyBase + s * uy[n]);
-          ctx.lineTo(scx + s * ux[idx], scyBase + s * uy[idx]);
-          ctx.closePath();
-          ctx.fillStyle = darkenColor(T.fill, shades[e]);
-          ctx.fill();
-          ctx.lineWidth = Math.max(0.5, s * 0.02);
-          ctx.strokeStyle = 'rgba(12,15,21,0.55)';
-          ctx.stroke();
+      // glow pass (lava + goal). Two gradients built ONCE and reused via translate.
+      const glowR = s * 1.6;
+      const makeGlow = (color: string) => {
+        const g = c.createRadialGradient(0, 0, 0, 0, 0, glowR);
+        g.addColorStop(0, color); g.addColorStop(1, 'rgba(0,0,0,0)');
+        return g;
+      };
+      const lavaGlow = makeGlow('rgba(255,110,30,0.42)');
+      const treeGlow = makeGlow('rgba(110,169,63,0.5)');
+      for (const hex of data.map) {
+        const tree = treeMap.has(`${hex.q},${hex.r}`);
+        if (hex.terrain !== 'lava' && !tree) continue;
+        const sp = screenOf(hex); if (!sp) continue;
+        const { scx, cy } = sp;
+        if (scx < -s * 2 || scx > W + s * 2 || cy < -s * 2 || cy > H + s * 2) continue;
+        c.save(); c.translate(scx, cy);
+        c.fillStyle = tree ? treeGlow : lavaGlow;
+        c.beginPath(); c.arc(0, 0, glowR, 0, Math.PI * 2); c.fill();
+        c.restore();
+      }
+
+      const order = isometric
+        ? [...data.map].sort((a, b) => (a.r - a.tier * 0.5) - (b.r - b.tier * 0.5))
+        : data.map;
+
+      for (const hex of order) {
+        const sp = screenOf(hex); if (!sp) continue;
+        const { scx, scyBase, cy } = sp;
+        if (scx < -s * 2 || scx > W + s * 2 || cy < -s * 2 || cy > H + s * 2) continue;
+
+        const T = TERRAIN[hex.terrain] ?? TERRAIN.grass;
+
+        // elevation walls
+        if (isometric && hex.tier > 0) {
+          const edges = [2, 3, 4];
+          const shades = [0.5, 0.4, 0.45];
+          for (let e = 0; e < 3; e++) {
+            const idx = edges[e], n = (idx + 1) % 6;
+            c.beginPath();
+            c.moveTo(scx + s * ux[idx], cy + s * uy[idx]);
+            c.lineTo(scx + s * ux[n], cy + s * uy[n]);
+            c.lineTo(scx + s * ux[n], scyBase + s * uy[n]);
+            c.lineTo(scx + s * ux[idx], scyBase + s * uy[idx]);
+            c.closePath();
+            c.fillStyle = darkenColor(T.fill, shades[e]);
+            c.fill();
+            c.lineWidth = Math.max(0.5, s * 0.02);
+            c.strokeStyle = 'rgba(12,15,21,0.55)';
+            c.stroke();
+          }
+        }
+
+        // top face — flat terrain colour, faint edge
+        tracePath(c, scx, cy, s);
+        c.fillStyle = T.fill; c.fill();
+        c.lineWidth = Math.max(0.4, s * 0.03);
+        c.strokeStyle = 'rgba(12,15,21,0.14)';
+        c.stroke();
+
+        // tier darkening
+        if (hex.tier >= 1) {
+          tracePath(c, scx, cy, s);
+          c.save(); c.clip();
+          c.fillStyle = hex.tier >= 2 ? 'rgba(20,24,31,0.40)' : 'rgba(20,24,31,0.22)';
+          c.fillRect(scx - s, cy - s, 2 * s, 2 * s);
+          c.restore();
+        }
+
+        const key = `${hex.q},${hex.r}`;
+        const isSpawn = spawnSet.has(key);
+        const isTree = treeMap.has(key);
+
+        // marker footprint aura (rings around spawns / world trees)
+        const aura = auraMap.get(key);
+        if (aura && !isSpawn && !isTree) {
+          tracePath(c, scx, cy, s);
+          c.fillStyle = aura === 'spawn' ? 'rgba(211,73,27,0.30)'
+            : aura === 'tree1' ? 'rgba(190,255,120,0.45)' : 'rgba(190,255,120,0.26)';
+          c.fill();
+          c.lineWidth = Math.max(1.5, s * 0.08);
+          c.strokeStyle = aura === 'spawn' ? 'rgba(255,120,60,0.85)'
+            : aura === 'tree1' ? 'rgba(224,255,150,1)' : 'rgba(200,255,130,0.9)';
+          c.stroke();
+        }
+
+        // markers
+        if (isTree) {
+          tracePath(c, scx, cy, s * 0.5);
+          c.fillStyle = '#ecc846'; c.fill();
+          c.lineWidth = Math.max(1, s * 0.05); c.strokeStyle = '#14181f'; c.stroke();
+          if (worldTrees.length > 1) {
+            c.fillStyle = '#14181f'; c.font = `bold ${Math.round(s * 0.5)}px var(--font-ui, sans-serif)`;
+            c.textAlign = 'center'; c.textBaseline = 'middle';
+            c.fillText(String(treeMap.get(key)), scx, cy);
+          }
+        } else if (isSpawn) {
+          c.beginPath(); c.arc(scx, cy, s * 0.34, 0, Math.PI * 2);
+          c.fillStyle = '#d3491b'; c.fill();
+          c.lineWidth = Math.max(1.5, s * 0.07); c.strokeStyle = '#fff'; c.stroke();
         }
       }
+    };
 
-      // top face — flat terrain colour, faint edge (calm + cheap)
-      tracePath(scx, cy, s);
-      ctx.fillStyle = T.fill; ctx.fill();
-      ctx.lineWidth = Math.max(0.4, s * 0.03);
-      ctx.strokeStyle = 'rgba(12,15,21,0.14)';
-      ctx.stroke();
-
-      // tier darkening
-      if (hex.tier >= 1) {
-        tracePath(scx, cy, s);
-        ctx.save(); ctx.clip();
-        ctx.fillStyle = hex.tier >= 2 ? 'rgba(20,24,31,0.40)' : 'rgba(20,24,31,0.22)';
-        ctx.fillRect(scx - s, cy - s, 2 * s, 2 * s);
-        ctx.restore();
-      }
-
-      const key = `${hex.q},${hex.r}`;
-      const isSpawn = spawnSet.has(key);
-      const isTree = treeMap.has(key);
-
-      // marker footprint aura (rings around spawns / world trees)
-      const aura = auraMap.get(key);
-      if (aura && !isSpawn && !isTree) {
-        tracePath(scx, cy, s);
-        // Tree rings use a bright lime (distinct from grass, which is the same
-        // canopy green) so the footprint reads on grass and every other terrain.
-        ctx.fillStyle = aura === 'spawn' ? 'rgba(211,73,27,0.30)'
-          : aura === 'tree1' ? 'rgba(190,255,120,0.45)' : 'rgba(190,255,120,0.26)';
-        ctx.fill();
-        ctx.lineWidth = Math.max(1.5, s * 0.08);
-        ctx.strokeStyle = aura === 'spawn' ? 'rgba(255,120,60,0.85)'
-          : aura === 'tree1' ? 'rgba(224,255,150,1)' : 'rgba(200,255,130,0.9)';
-        ctx.stroke();
-      }
-
-      // markers
-      if (isTree) {
-        tracePath(scx, cy, s * 0.5);
-        ctx.fillStyle = '#ecc846'; ctx.fill();
-        ctx.lineWidth = Math.max(1, s * 0.05); ctx.strokeStyle = '#14181f'; ctx.stroke();
-        if (worldTrees.length > 1) {
-          ctx.fillStyle = '#14181f'; ctx.font = `bold ${Math.round(s * 0.5)}px var(--font-ui, sans-serif)`;
-          ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-          ctx.fillText(String(treeMap.get(key)), scx, cy);
+    // ----- overlays (hover footprint + selection) — only a few hexes, drawn every frame -----
+    const drawOverlays = (c: CanvasRenderingContext2D) => {
+      c.setTransform(dpr, 0, 0, dpr, 0, 0);
+      if (editModeRef.current === 'brush' && brushHover.current.size > 0) {
+        for (const id of brushHover.current) {
+          const hex = idToHex.get(id); if (!hex) continue;
+          const sp = screenOf(hex); if (!sp) continue;
+          tracePath(c, sp.scx, sp.cy, s);
+          c.fillStyle = 'rgba(246,217,112,0.16)'; c.fill();
+          c.lineWidth = Math.max(1, s * 0.05); c.strokeStyle = 'rgba(246,217,112,0.7)'; c.stroke();
         }
-      } else if (isSpawn) {
-        ctx.beginPath(); ctx.arc(scx, cy, s * 0.34, 0, Math.PI * 2);
-        ctx.fillStyle = '#d3491b'; ctx.fill();
-        ctx.lineWidth = Math.max(1.5, s * 0.07); ctx.strokeStyle = '#fff'; ctx.stroke();
       }
+      const selId = selected?.id;
+      const ids = new Set<string>(selectedMultiple);
+      if (selId) ids.add(selId);
+      for (const id of ids) {
+        const hex = idToHex.get(id); if (!hex) continue;
+        const sp = screenOf(hex); if (!sp) continue;
+        c.save();
+        tracePath(c, sp.scx, sp.cy, s);
+        if (id === selId) { c.shadowColor = 'rgba(246,217,112,0.85)'; c.shadowBlur = 14; c.strokeStyle = '#f6d970'; c.lineWidth = Math.max(2, s * 0.1); }
+        else { c.strokeStyle = '#ecc846'; c.lineWidth = Math.max(1.5, s * 0.06); }
+        c.stroke();
+        c.restore();
+      }
+    };
 
-      // brush footprint preview (sun-tinted hexes under the brush)
-      if (editModeRef.current === 'brush' && brushHover.current.has(hex.id)) {
-        tracePath(scx, cy, s);
-        ctx.fillStyle = 'rgba(246,217,112,0.16)';
-        ctx.fill();
-        ctx.lineWidth = Math.max(1, s * 0.05);
-        ctx.strokeStyle = 'rgba(246,217,112,0.7)';
-        ctx.stroke();
-      }
-
-      // selection / multi-select outline
-      const isSel = hex.id === selId;
-      const isMulti = multi.has(hex.id);
-      if (isSel || isMulti) {
-        ctx.save();
-        tracePath(scx, cy, s);
-        if (isSel) { ctx.shadowColor = 'rgba(246,217,112,0.85)'; ctx.shadowBlur = 14; ctx.strokeStyle = '#f6d970'; ctx.lineWidth = Math.max(2, s * 0.1); }
-        else { ctx.strokeStyle = '#ecc846'; ctx.lineWidth = Math.max(1.5, s * 0.06); }
-        ctx.stroke();
-        ctx.restore();
-      }
+    // ensure the offscreen base canvas exists and matches the device size
+    let base = baseCanvasRef.current;
+    if (!base) { base = document.createElement('canvas'); baseCanvasRef.current = base; baseDirty.current = true; }
+    if (base.width !== pxW || base.height !== pxH) { base.width = pxW; base.height = pxH; baseDirty.current = true; }
+    if (baseDirty.current) {
+      const bctx = base.getContext('2d');
+      if (bctx) { renderScene(bctx); baseDirty.current = false; }
     }
+
+    // composite: cached base bitmap (cheap blit) + live overlays
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, pxW, pxH);
+    ctx.drawImage(base, 0, 0);
+    drawOverlays(ctx);
   }, [data, viewSize, sizePx, scale, fitScale, offset, bounds, isometric, hexCenters,
-    spawnSet, treeMap, auraMap, worldTrees, selected, selectedMultiple]);
+    spawnSet, treeMap, auraMap, worldTrees, selected, selectedMultiple, idToHex]);
 
   drawRef.current = draw;
 
-  // redraw whenever anything visual changes (coalesced to one repaint per frame)
-  useEffect(() => { scheduleDraw(); }, [draw, scheduleDraw]);
+  // Invalidate the cached base bitmap when the SCENE or camera changes (NOT on
+  // hover / selection — those are overlay-only and just re-composite).
+  useEffect(() => { baseDirty.current = true; scheduleDraw(); }, [
+    data, viewSize, sizePx, scale, fitScale, offset, bounds, isometric,
+    hexCenters, spawnSet, treeMap, auraMap, worldTrees, scheduleDraw,
+  ]);
+
+  // Re-composite (coalesced) when selection changes — base stays cached.
+  useEffect(() => { scheduleDraw(); }, [selected, selectedMultiple, scheduleDraw]);
 
   // ---- inspector helpers ----------------------------------------------------
   const choosePaletteTerrain = (t: string) => setBrushTerrain(t);
