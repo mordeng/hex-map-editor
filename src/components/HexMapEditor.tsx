@@ -109,6 +109,31 @@ function offsetNeighbors(q: number, r: number): [number, number][] {
   return ODDR_DIRS[parity].map(([dq, dr]) => [q + dq, r + dr] as [number, number]);
 }
 
+// All offset coords within `radius` odd-r steps of (q,r), centre included (a
+// filled hex disk). radius 0 → just the centre; 1 → centre + 6 neighbours (7);
+// 2 → centre + 6 + 12 (19). Built by BFS over offsetNeighbors so the odd-row
+// stagger is handled correctly at every ring.
+function hexDisk(q: number, r: number, radius: number): [number, number][] {
+  const out: [number, number][] = [[q, r]];
+  if (radius <= 0) return out;
+  const visited = new Set<string>([`${q},${r}`]);
+  let frontier: [number, number][] = [[q, r]];
+  for (let d = 0; d < radius; d++) {
+    const next: [number, number][] = [];
+    for (const [cq, cr] of frontier) {
+      for (const [nq, nr] of offsetNeighbors(cq, cr)) {
+        const k = `${nq},${nr}`;
+        if (visited.has(k)) continue;
+        visited.add(k);
+        next.push([nq, nr]);
+        out.push([nq, nr]);
+      }
+    }
+    frontier = next;
+  }
+  return out;
+}
+
 // --------------------------------------------------------------------------
 // MAIN COMPONENT
 // --------------------------------------------------------------------------
@@ -198,8 +223,10 @@ export default function HexMapEditor() {
 
   const [brushTerrain, setBrushTerrain] = useState<string>('grass');
   const [brushTier, setBrushTier] = useState<number>(0);
+  const [brushRadius, setBrushRadius] = useState<number>(0); // 0 = single, 1 = +6, 2 = +12
   const isBrushPainting = useRef(false);
   const paintedInStroke = useRef<Set<string>>(new Set());
+  const brushHover = useRef<Set<string>>(new Set()); // hex ids under the brush footprint
 
   const [selCollapsed, setSelCollapsed] = useState(false);
   const [isometric, setIsometric] = useState(false);
@@ -569,18 +596,62 @@ export default function HexMapEditor() {
   }, [offset, fitScale, scale, bounds]);
 
   // ---- painting -------------------------------------------------------------
-  // Hot path: mutate the hex in place and redraw imperatively (no React state
-  // churn). The stroke is committed to state once on mouse-up.
-  const paintHexWithBrush = useCallback((hex: Hex) => {
-    if (paintedInStroke.current.has(hex.id)) return;
-    const terrain = brushTerrain;
-    const tier = brushTier;
-    if (hex.terrain === terrain && hex.tier === tier) return;
-    paintedInStroke.current.add(hex.id);
-    hex.terrain = terrain;
-    hex.tier = tier;
+  // Coord → hex lookup, used to resolve a brush footprint (centre + neighbours)
+  // to the actual hex objects. The array reference only changes on mouse-up, so
+  // this stays valid (and points at the same mutated objects) during a stroke.
+  const hexByCoord = useMemo(() => {
+    const m = new Map<string, Hex>();
+    if (data) for (const h of data.map) m.set(`${h.q},${h.r}`, h);
+    return m;
+  }, [data]);
+
+  // Hot path: mutate hexes in place and redraw imperatively (no React state
+  // churn). The stroke is committed to state once on mouse-up. With a brush
+  // radius > 0 the centre hex plus its surrounding ring(s) are painted in one dab.
+  const paintHexWithBrush = useCallback((centerHex: Hex) => {
+    const paintOne = (hex: Hex): boolean => {
+      if (paintedInStroke.current.has(hex.id)) return false;
+      if (hex.terrain === brushTerrain && hex.tier === brushTier) return false;
+      paintedInStroke.current.add(hex.id);
+      hex.terrain = brushTerrain;
+      hex.tier = brushTier;
+      return true;
+    };
+    let changed = false;
+    if (brushRadius <= 0) {
+      changed = paintOne(centerHex);
+    } else {
+      for (const [q, r] of hexDisk(centerHex.q, centerHex.r, brushRadius)) {
+        const h = hexByCoord.get(`${q},${r}`);
+        if (h && paintOne(h)) changed = true;
+      }
+    }
+    if (changed) drawRef.current?.();
+  }, [brushTerrain, brushTier, brushRadius, hexByCoord]);
+
+  // Update the brush footprint preview (hex ids under the brush). Redraws only
+  // when the set of covered hexes actually changes, to avoid per-pixel churn.
+  const updateBrushHover = useCallback((center: Hex | null) => {
+    const next = new Set<string>();
+    if (center) {
+      if (brushRadius <= 0) {
+        next.add(center.id);
+      } else {
+        for (const [q, r] of hexDisk(center.q, center.r, brushRadius)) {
+          const h = hexByCoord.get(`${q},${r}`);
+          if (h) next.add(h.id);
+        }
+      }
+    }
+    const prev = brushHover.current;
+    if (prev.size === next.size) {
+      let same = true;
+      for (const id of next) if (!prev.has(id)) { same = false; break; }
+      if (same) return;
+    }
+    brushHover.current = next;
     drawRef.current?.();
-  }, [brushTerrain, brushTier]);
+  }, [brushRadius, hexByCoord]);
 
   const onMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (e.button !== 0) return;
@@ -611,10 +682,14 @@ export default function HexMapEditor() {
   };
 
   const onMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (isBrushPainting.current) {
+    if (editMode === 'brush') {
       const world = eventToWorld(e.clientX, e.clientY);
-      if (world) { const hex = findHexAtPoint(world.x, world.y); if (hex) paintHexWithBrush(hex); }
-      return;
+      const hex = world ? findHexAtPoint(world.x, world.y) : null;
+      updateBrushHover(hex); // footprint preview follows the cursor
+      if (isBrushPainting.current) {
+        if (hex) paintHexWithBrush(hex);
+        return;
+      }
     }
     if (isDragSelecting.current && (e.ctrlKey || e.metaKey)) {
       const world = eventToWorld(e.clientX, e.clientY);
@@ -648,6 +723,8 @@ export default function HexMapEditor() {
     }
     isPanning.current = false; isDragSelecting.current = false; isBrushPainting.current = false;
     paintedInStroke.current.clear();
+    // clear the footprint preview when the cursor leaves / the stroke ends
+    if (brushHover.current.size > 0) { brushHover.current = new Set(); drawRef.current?.(); }
   };
 
   // wheel: tier on selection (select mode), otherwise zoom.
@@ -826,6 +903,16 @@ export default function HexMapEditor() {
         ctx.beginPath(); ctx.arc(scx, cy, s * 0.34, 0, Math.PI * 2);
         ctx.fillStyle = '#d3491b'; ctx.fill();
         ctx.lineWidth = Math.max(1.5, s * 0.07); ctx.strokeStyle = '#fff'; ctx.stroke();
+      }
+
+      // brush footprint preview (sun-tinted hexes under the brush)
+      if (editModeRef.current === 'brush' && brushHover.current.has(hex.id)) {
+        tracePath(scx, cy, s);
+        ctx.fillStyle = 'rgba(246,217,112,0.16)';
+        ctx.fill();
+        ctx.lineWidth = Math.max(1, s * 0.05);
+        ctx.strokeStyle = 'rgba(246,217,112,0.7)';
+        ctx.stroke();
       }
 
       // selection / multi-select outline
@@ -1023,6 +1110,16 @@ export default function HexMapEditor() {
                   <div className="tierseg">
                     {[0, 1, 2, 3].map(t => (
                       <div key={t} className={`tier${brushTier === t ? ' on' : ''}`} onClick={() => setBrushTier(t)}>{t}</div>
+                    ))}
+                  </div>
+                  <span className="label">Brush size</span>
+                  <div className="tierseg">
+                    {[
+                      { r: 0, label: '1', title: 'Single hex' },
+                      { r: 1, label: '7', title: 'Hex + 6 surrounding' },
+                      { r: 2, label: '19', title: 'Hex + 6 + 12 surrounding' },
+                    ].map(({ r, label, title }) => (
+                      <div key={r} className={`tier${brushRadius === r ? ' on' : ''}`} title={title} onClick={() => setBrushRadius(r)}>{label}</div>
                     ))}
                   </div>
                   <div className="hint sun">Click &amp; drag on the map to paint</div>
