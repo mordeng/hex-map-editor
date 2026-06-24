@@ -208,6 +208,46 @@ function GalleryThumb({ url }: { url: string }) {
   return failed ? <div className="gthumb-fail">No preview</div> : <canvas ref={ref} className="gthumb" />;
 }
 
+// Mini icon of a brush footprint: the filled hex disk for a given radius
+// (0 → single, 1 → centre + 6, 2 → centre + 6 + 12). The centre hex is drawn
+// solid and the surrounding ring(s) faded so the pattern reads at a glance.
+// Uses currentColor so it inherits the button's text colour (incl. active state).
+function BrushSizeIcon({ radius }: { radius: number }) {
+  const R = 5; // mini hex radius
+  const SQRT3 = Math.sqrt(3);
+  const cells = hexDisk(0, 0, radius).map(([q, r]) => {
+    const parity = ((r % 2) + 2) % 2;
+    return { q, r, x: R * SQRT3 * (q + parity / 2), y: R * 1.5 * r };
+  });
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const c of cells) { minX = Math.min(minX, c.x); maxX = Math.max(maxX, c.x); minY = Math.min(minY, c.y); maxY = Math.max(maxY, c.y); }
+  const pad = R + 1;
+  const w = (maxX - minX) + pad * 2, h = (maxY - minY) + pad * 2;
+  const corners = (cx: number, cy: number) => {
+    let pts = '';
+    for (let i = 0; i < 6; i++) { const a = ((30 + 60 * i) * Math.PI) / 180; pts += `${(cx + R * Math.cos(a)).toFixed(1)},${(cy + R * Math.sin(a)).toFixed(1)} `; }
+    return pts.trim();
+  };
+  return (
+    <svg viewBox={`0 0 ${w.toFixed(1)} ${h.toFixed(1)}`} width="30" height="30" style={{ display: 'block' }}>
+      {cells.map((c, i) => {
+        const center = c.q === 0 && c.r === 0;
+        return (
+          <polygon
+            key={i}
+            points={corners(c.x - minX + pad, c.y - minY + pad)}
+            fill="currentColor"
+            fillOpacity={center ? 0.95 : 0.4}
+            stroke="currentColor"
+            strokeOpacity={0.6}
+            strokeWidth={0.6}
+          />
+        );
+      })}
+    </svg>
+  );
+}
+
 export default function HexMapEditor() {
   const [data, setData] = useState<MapData | null>(null);
   const [selected, setSelected] = useState<Hex | null>(null);
@@ -262,6 +302,18 @@ export default function HexMapEditor() {
   const fileRef = useRef<HTMLInputElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const drawRef = useRef<(() => void) | null>(null); // latest draw(), for imperative redraws
+
+  // Coalesce redraws into a single requestAnimationFrame. A burst of pointer
+  // events (hover, pan, paint) can fire many times per frame; without this each
+  // one triggered a synchronous full-canvas repaint and they queued up on the
+  // main thread, so the visible update lagged the cursor by hundreds of ms.
+  // Now at most one repaint happens per frame, no matter how fast events arrive.
+  const rafId = useRef<number | null>(null);
+  const scheduleDraw = useCallback(() => {
+    if (rafId.current != null) return;
+    rafId.current = requestAnimationFrame(() => { rafId.current = null; drawRef.current?.(); });
+  }, []);
+  useEffect(() => () => { if (rafId.current != null) cancelAnimationFrame(rafId.current); }, []);
   const lastFileHandle = useRef<FileSystemFileHandle | null>(null);
   const lastFileName = useRef<string>('map.json');
 
@@ -626,8 +678,8 @@ export default function HexMapEditor() {
         if (h && paintOne(h)) changed = true;
       }
     }
-    if (changed) drawRef.current?.();
-  }, [brushTerrain, brushTier, brushRadius, hexByCoord]);
+    if (changed) scheduleDraw();
+  }, [brushTerrain, brushTier, brushRadius, hexByCoord, scheduleDraw]);
 
   // Update the brush footprint preview (hex ids under the brush). Redraws only
   // when the set of covered hexes actually changes, to avoid per-pixel churn.
@@ -650,8 +702,8 @@ export default function HexMapEditor() {
       if (same) return;
     }
     brushHover.current = next;
-    drawRef.current?.();
-  }, [brushRadius, hexByCoord]);
+    scheduleDraw();
+  }, [brushRadius, hexByCoord, scheduleDraw]);
 
   const onMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (e.button !== 0) return;
@@ -724,7 +776,7 @@ export default function HexMapEditor() {
     isPanning.current = false; isDragSelecting.current = false; isBrushPainting.current = false;
     paintedInStroke.current.clear();
     // clear the footprint preview when the cursor leaves / the stroke ends
-    if (brushHover.current.size > 0) { brushHover.current = new Set(); drawRef.current?.(); }
+    if (brushHover.current.size > 0) { brushHover.current = new Set(); scheduleDraw(); }
   };
 
   // wheel: tier on selection (select mode), otherwise zoom.
@@ -807,7 +859,19 @@ export default function HexMapEditor() {
       ? [...data.map].sort((a, b) => (a.r - a.tier * 0.5) - (b.r - b.tier * 0.5))
       : data.map;
 
-    // glow pass (lava + goal)
+    // glow pass (lava + goal). Build the two gradients ONCE per frame at the
+    // origin and reuse them via ctx.translate — previously a fresh
+    // createRadialGradient was allocated per glowing hex every repaint, which
+    // dominated draw cost on lava-heavy maps.
+    const glowR = s * 1.6;
+    const makeGlow = (color: string) => {
+      const g = ctx.createRadialGradient(0, 0, 0, 0, 0, glowR);
+      g.addColorStop(0, color);
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      return g;
+    };
+    const lavaGlow = makeGlow('rgba(255,110,30,0.42)');
+    const treeGlow = makeGlow('rgba(110,169,63,0.5)');
     for (const hex of data.map) {
       const tree = treeMap.has(`${hex.q},${hex.r}`);
       if (hex.terrain !== 'lava' && !tree) continue;
@@ -815,11 +879,11 @@ export default function HexMapEditor() {
       const scx = (p.x - halfW) * eff + baseX;
       const cy = (p.y - halfH) * eff + baseY - (isometric ? hex.tier * tierH : 0);
       if (scx < -s * 2 || scx > W + s * 2 || cy < -s * 2 || cy > H + s * 2) continue;
-      const g = ctx.createRadialGradient(scx, cy, 0, scx, cy, s * 1.6);
-      g.addColorStop(0, tree ? 'rgba(110,169,63,0.5)' : 'rgba(255,110,30,0.42)');
-      g.addColorStop(1, 'rgba(0,0,0,0)');
-      ctx.fillStyle = g;
-      ctx.beginPath(); ctx.arc(scx, cy, s * 1.6, 0, Math.PI * 2); ctx.fill();
+      ctx.save();
+      ctx.translate(scx, cy);
+      ctx.fillStyle = tree ? treeGlow : lavaGlow;
+      ctx.beginPath(); ctx.arc(0, 0, glowR, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
     }
 
     const selId = selected?.id;
@@ -932,8 +996,8 @@ export default function HexMapEditor() {
 
   drawRef.current = draw;
 
-  // redraw whenever anything visual changes
-  useEffect(() => { draw(); }, [draw]);
+  // redraw whenever anything visual changes (coalesced to one repaint per frame)
+  useEffect(() => { scheduleDraw(); }, [draw, scheduleDraw]);
 
   // ---- inspector helpers ----------------------------------------------------
   const choosePaletteTerrain = (t: string) => setBrushTerrain(t);
@@ -1113,13 +1177,15 @@ export default function HexMapEditor() {
                     ))}
                   </div>
                   <span className="label">Brush size</span>
-                  <div className="tierseg">
+                  <div className="tierseg brushsize">
                     {[
-                      { r: 0, label: '1', title: 'Single hex' },
-                      { r: 1, label: '7', title: 'Hex + 6 surrounding' },
-                      { r: 2, label: '19', title: 'Hex + 6 + 12 surrounding' },
-                    ].map(({ r, label, title }) => (
-                      <div key={r} className={`tier${brushRadius === r ? ' on' : ''}`} title={title} onClick={() => setBrushRadius(r)}>{label}</div>
+                      { r: 0, title: 'Single hex' },
+                      { r: 1, title: 'Hex + 6 surrounding (7)' },
+                      { r: 2, title: 'Hex + 6 + 12 surrounding (19)' },
+                    ].map(({ r, title }) => (
+                      <div key={r} className={`tier${brushRadius === r ? ' on' : ''}`} title={title} onClick={() => setBrushRadius(r)}>
+                        <BrushSizeIcon radius={r} />
+                      </div>
                     ))}
                   </div>
                   <div className="hint sun">Click &amp; drag on the map to paint</div>

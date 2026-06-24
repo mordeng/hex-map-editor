@@ -385,6 +385,8 @@
 
   /* tier segmented */
   .tierseg { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  .tierseg.brushsize { grid-template-columns: repeat(3, 1fr); margin-bottom: 4px; }
+  .tierseg.brushsize .tier { height: 48px; }
   .tier { height: 40px; border-radius: var(--r-sm); border: 1px solid var(--border-hairline); background: rgba(0,0,0,0.3); color: var(--fg-secondary); cursor: pointer; font-family: var(--font-ui); font-weight: 700; font-size: 16px; letter-spacing: 0.04em; display: grid; place-items: center; transition: all .15s ease; position: relative; }
   .tier:hover { border-color: var(--border-strong); color: var(--fg-primary); }
   .tier.on { background: var(--sun-400); color: var(--ink-900); border-color: var(--sun-500); }
