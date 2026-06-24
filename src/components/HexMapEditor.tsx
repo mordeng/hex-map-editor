@@ -693,7 +693,10 @@ export default function HexMapEditor() {
         if (h && paintOne(h)) changed = true;
       }
     }
-    if (changed) { baseDirty.current = true; scheduleDraw(); } // paint changes the scene -> rebuild base
+    // Don't rebuild the whole base bitmap per dab — the painted hexes are drawn
+    // cheaply as an overlay during the stroke (see drawOverlays). The single full
+    // base rebuild happens once on mouse-up, when setData fires the scene effect.
+    if (changed) scheduleDraw();
   }, [brushTerrain, brushTier, brushRadius, hexByCoord, scheduleDraw]);
 
   // Update the brush footprint preview (hex ids under the brush). Redraws only
@@ -984,6 +987,28 @@ export default function HexMapEditor() {
     // ----- overlays (hover footprint + selection) — only a few hexes, drawn every frame -----
     const drawOverlays = (c: CanvasRenderingContext2D) => {
       c.setTransform(dpr, 0, 0, dpr, 0, 0);
+      // In-stroke paint preview: the cached base still shows the pre-stroke
+      // colours, so paint the just-changed hexes (already mutated in place) on
+      // top with their new terrain + tier shading. Cost is proportional to the
+      // stroke, not the whole map; the base is rebuilt once on mouse-up.
+      if (paintedInStroke.current.size > 0) {
+        for (const id of paintedInStroke.current) {
+          const hex = idToHex.get(id); if (!hex) continue;
+          const sp = screenOf(hex); if (!sp) continue;
+          const T = TERRAIN[hex.terrain] ?? TERRAIN.grass;
+          tracePath(c, sp.scx, sp.cy, s);
+          c.fillStyle = T.fill; c.fill();
+          c.lineWidth = Math.max(0.4, s * 0.03);
+          c.strokeStyle = 'rgba(12,15,21,0.14)'; c.stroke();
+          if (hex.tier >= 1) {
+            tracePath(c, sp.scx, sp.cy, s);
+            c.save(); c.clip();
+            c.fillStyle = hex.tier >= 2 ? 'rgba(20,24,31,0.40)' : 'rgba(20,24,31,0.22)';
+            c.fillRect(sp.scx - s, sp.cy - s, 2 * s, 2 * s);
+            c.restore();
+          }
+        }
+      }
       if (editModeRef.current === 'brush' && brushHover.current.size > 0) {
         for (const id of brushHover.current) {
           const hex = idToHex.get(id); if (!hex) continue;
