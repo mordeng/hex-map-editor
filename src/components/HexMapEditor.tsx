@@ -7,7 +7,12 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Hexagon, Upload, Undo2, Save, CopyPlus, Brush, MapPin, MousePointer2,
   Palette, List, ChevronUp, ChevronDown, Minus, Plus, Maximize, TreePine, Box, Send, X, LayoutGrid,
+  LogIn, LogOut, Pencil,
 } from 'lucide-react';
+import {
+  captureTokenFromHash, getSession, authHeader, login as steamLogin, logout as steamLogout,
+  type SteamSession,
+} from '@/lib/session';
 
 // wtd-analytics map-submission endpoint (override if the deployed domain differs)
 // wtd-analytics base URL — override at build time with NEXT_PUBLIC_WTD_ANALYTICS_BASE.
@@ -153,12 +158,16 @@ type EditMode = 'select' | 'brush' | 'spawn' | 'goal';
 interface Snapshot { map: Hex[]; spawnPoints: SpawnPoint[]; worldTrees: WorldTree[] }
 
 interface GalleryItem {
+  id?: string;
   name: string;
   biome: string;
   submittedBy: string;
   notes?: string;
   ts: number;
+  updatedAt?: number;
   url: string;
+  owned?: boolean;        // public list: map has an owner (someone can edit it)
+  ownerSteamId?: string;  // only present in "my maps" responses
   stats?: { hexes: number; spawns: number; goals: number; biomes: number };
 }
 
@@ -297,6 +306,11 @@ export default function HexMapEditor() {
   const [subStatus, setSubStatus] = useState<'idle' | 'sending' | 'ok' | 'error'>('idle');
   const [subMsg, setSubMsg] = useState('');
 
+  // Steam auth + editing-an-owned-map
+  const [session, setSession] = useState<SteamSession | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null); // non-null => Submit updates this map
+  const [galleryMine, setGalleryMine] = useState(false);           // gallery showing "My Maps"
+
   // camera
   const [scale, setScale] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
@@ -358,7 +372,15 @@ export default function HexMapEditor() {
     setOffset({ x: 0, y: 0 });
     historyRef.current = [];
     setHistoryVersion(v => v + 1);
+    setEditingId(null); // any fresh load is a new map until "My Maps" sets an id
     if (name) setFileName(name);
+  }, []);
+
+  // Capture a Steam token arriving in the URL fragment (#token=...) after login,
+  // then resolve the current session for the UI.
+  useEffect(() => {
+    captureTokenFromHash();
+    setSession(getSession());
   }, []);
 
   useEffect(() => {
@@ -1092,29 +1114,34 @@ export default function HexMapEditor() {
   const choosePaletteTerrain = (t: string) => setBrushTerrain(t);
 
   // ---- map gallery (browse + load submitted maps) ----
-  const openGallery = async () => {
+  const openGallery = async (mine = false) => {
     setGalleryOpen(true);
+    setGalleryMine(mine);
     setGalleryState('loading');
     setGalleryErr('');
     try {
-      const res = await fetch(`${ANALYTICS_BASE}/api/maps`, { headers: { 'X-Submit-Token': SUBMIT_TOKEN } });
+      const url = `${ANALYTICS_BASE}/api/maps${mine ? '?mine=1' : ''}`;
+      const res = await fetch(url, { headers: { 'X-Submit-Token': SUBMIT_TOKEN, ...(mine ? authHeader() : {}) } });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setGalleryMaps(Array.isArray(data.maps) ? data.maps : []);
       setGalleryState('idle');
     } catch {
       setGalleryState('error');
-      setGalleryErr('Could not load the gallery.');
+      setGalleryErr(mine ? 'Could not load your maps.' : 'Could not load the gallery.');
     }
   };
 
-  const loadFromGallery = async (item: GalleryItem) => {
+  // Load a map from the gallery. When `edit` is set (My Maps), remember its id so
+  // the next Submit updates that map in place instead of creating a new one.
+  const loadFromGallery = async (item: GalleryItem, edit = false) => {
     try {
       const res = await fetch(item.url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const parsed = (await res.json()) as MapData;
       lastFileHandle.current = null; // loaded from gallery -> Save becomes Save As
       applyLoadedMap(parsed, item.name ? `${item.name}.json` : 'map.json');
+      setEditingId(edit && item.id ? item.id : null);
       setGalleryOpen(false);
     } catch {
       setGalleryErr('Failed to load that map.');
@@ -1149,30 +1176,40 @@ export default function HexMapEditor() {
       setSubMsg('Please enter a map name.');
       return;
     }
+    const isEdit = !!editingId;
     setSubStatus('sending');
-    setSubMsg('Checking name…');
+    setSubMsg(isEdit ? 'Saving…' : 'Checking name…');
     try {
-      // Reject duplicate names: a map with this name (case-insensitive) must not
-      // already exist in the gallery before we submit.
-      const listRes = await fetch(`${ANALYTICS_BASE}/api/maps`, { headers: { 'X-Submit-Token': SUBMIT_TOKEN } });
-      if (listRes.ok) {
-        const listData = await listRes.json().catch(() => ({}));
-        const existing: GalleryItem[] = Array.isArray(listData.maps) ? listData.maps : [];
-        if (existing.some(m => m.name?.trim().toLowerCase() === trimmedName.toLowerCase())) {
-          setSubStatus('error');
-          setSubMsg(`A map named “${trimmedName}” already exists. Choose a different name.`);
-          return;
+      // Reject duplicate names on NEW submissions only (an edit keeps its own
+      // name, which would otherwise collide with itself).
+      if (!isEdit) {
+        const listRes = await fetch(`${ANALYTICS_BASE}/api/maps`, { headers: { 'X-Submit-Token': SUBMIT_TOKEN } });
+        if (listRes.ok) {
+          const listData = await listRes.json().catch(() => ({}));
+          const existing: GalleryItem[] = Array.isArray(listData.maps) ? listData.maps : [];
+          if (existing.some(m => m.name?.trim().toLowerCase() === trimmedName.toLowerCase())) {
+            setSubStatus('error');
+            setSubMsg(`A map named “${trimmedName}” already exists. Choose a different name.`);
+            return;
+          }
         }
       }
-      setSubMsg('Sending…');
+      setSubMsg(isEdit ? 'Saving…' : 'Sending…');
       const res = await fetch(`${ANALYTICS_BASE}/api/maps`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Submit-Token': SUBMIT_TOKEN },
-        body: JSON.stringify({ name: trimmedName, biome: subBiome, submittedBy: subBy, notes: subNotes, map: exportData }),
+        method: isEdit ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Submit-Token': SUBMIT_TOKEN, ...authHeader() },
+        body: JSON.stringify(isEdit
+          ? { id: editingId, name: trimmedName, biome: subBiome, notes: subNotes, map: exportData }
+          : { name: trimmedName, biome: subBiome, submittedBy: subBy, notes: subNotes, map: exportData }),
       });
       if (res.status === 401) {
         setSubStatus('error');
-        setSubMsg('Submit rejected (token not configured on server).');
+        setSubMsg(isEdit ? 'Your session expired — sign in with Steam again.' : 'Submit rejected (token not configured on server).');
+        return;
+      }
+      if (res.status === 403) {
+        setSubStatus('error');
+        setSubMsg('You can only edit maps you own.');
         return;
       }
       if (res.status === 429) {
@@ -1187,13 +1224,16 @@ export default function HexMapEditor() {
         return;
       }
       setSubStatus('ok');
-      setSubMsg('Submitted ✓');
+      setSubMsg(isEdit ? 'Saved ✓' : 'Submitted ✓');
       setTimeout(() => { setSubmitOpen(false); setSubStatus('idle'); setSubMsg(''); }, 1300);
     } catch {
       setSubStatus('error');
       setSubMsg('Could not reach server (network/CORS).');
     }
   };
+
+  const handleLogin = () => steamLogin(ANALYTICS_BASE);
+  const handleLogout = () => { steamLogout(); setSession(null); setEditingId(null); };
   const cycleSelectedTerrain = () => {
     if (!selected) return;
     const i = TERRAIN_ORDER.indexOf(selected.terrain);
@@ -1219,11 +1259,22 @@ export default function HexMapEditor() {
         <div className="mapcrumb"><span className="dot" /> MAP <b>{crumbName || '—'}</b></div>
         <div className="spacer" />
         <button className="btn ghost" onClick={handleImportClick}><Upload /> Import</button>
-        <button className="btn ghost" onClick={openGallery}><LayoutGrid /> Gallery</button>
+        <button className="btn ghost" onClick={() => openGallery(false)}><LayoutGrid /> Gallery</button>
+        {session && <button className="btn ghost" onClick={() => openGallery(true)}><Pencil /> My Maps</button>}
         <button className={`btn${canUndo ? '' : ' disabled'}`} onClick={undo}><Undo2 /> Undo</button>
         <button className={`btn${data ? '' : ' disabled'}`} onClick={handleSave}><Save /> Save</button>
         <button className={`btn${data ? '' : ' disabled'}`} onClick={handleExport}><CopyPlus /> Save As</button>
         <button className={`btn primary${data ? '' : ' disabled'}`} onClick={openSubmit}><Send /> Submit</button>
+        {session ? (
+          <div className="userchip" title={`Signed in as ${session.name}`}>
+            {/* eslint-disable-next-line @next/next/no-img-element -- tiny external Steam avatar; next/image adds no value under static export */}
+            {session.avatar && <img src={session.avatar} alt="" className="userchip-av" />}
+            <span className="userchip-name">{session.name}</span>
+            <button className="userchip-out" onClick={handleLogout} title="Sign out"><LogOut /></button>
+          </div>
+        ) : (
+          <button className="btn ghost" onClick={handleLogin}><LogIn /> Sign in with Steam</button>
+        )}
         <input ref={fileRef} type="file" accept="application/json" style={{ display: 'none' }} onChange={handleImport} />
       </header>
 
@@ -1470,23 +1521,31 @@ export default function HexMapEditor() {
         <div className="overlay" onMouseDown={e => { if (e.target === e.currentTarget) setGalleryOpen(false); }}>
           <div className="modal wide" role="dialog" aria-modal="true">
             <div className="modal-head">
-              <div className="m-ico"><LayoutGrid /></div>
+              <div className="m-ico">{galleryMine ? <Pencil /> : <LayoutGrid />}</div>
               <div>
-                <h2>Map Gallery</h2>
-                <div className="m-sub">{galleryState === 'idle' ? `${galleryMaps.length} submitted maps` : 'Submitted maps'}</div>
+                <h2>{galleryMine ? 'My Maps' : 'Map Gallery'}</h2>
+                <div className="m-sub">
+                  {galleryState !== 'idle'
+                    ? (galleryMine ? 'Your maps' : 'Submitted maps')
+                    : galleryMine
+                      ? `${galleryMaps.length} editable map${galleryMaps.length === 1 ? '' : 's'}`
+                      : `${galleryMaps.length} submitted maps`}
+                </div>
               </div>
               <button className="icon-btn" onClick={() => setGalleryOpen(false)}><X /></button>
             </div>
             <div className="modal-body">
               {galleryState === 'loading' && <div className="g-empty">Loading…</div>}
               {galleryState === 'error' && <div className="g-empty">{galleryErr}</div>}
-              {galleryState === 'idle' && galleryMaps.length === 0 && <div className="g-empty">No maps submitted yet.</div>}
+              {galleryState === 'idle' && galleryMaps.length === 0 && (
+                <div className="g-empty">{galleryMine ? "You haven't submitted any maps while signed in yet." : 'No maps submitted yet.'}</div>
+              )}
               {galleryState === 'idle' && galleryMaps.length > 0 && (
                 <>
                   {galleryErr && <div className="g-empty" style={{ padding: '0 0 8px' }}>{galleryErr}</div>}
                   <div className="gallery-grid">
                     {galleryMaps.map((m, i) => (
-                      <div key={i} className="gcard" onClick={() => loadFromGallery(m)} title="Click to load">
+                      <div key={m.id ?? i} className="gcard" onClick={() => loadFromGallery(m, galleryMine)} title={galleryMine ? 'Click to edit' : 'Click to load'}>
                         <div className="gthumb-wrap"><GalleryThumb url={m.url} /></div>
                         <div className="gcard-body">
                           <div className="gcard-top">
@@ -1495,7 +1554,7 @@ export default function HexMapEditor() {
                           </div>
                           <div className="gmeta">by {m.submittedBy || 'anonymous'} · {m.stats?.hexes ?? '—'} hexes</div>
                         </div>
-                        <div className="gload"><Upload /> Load</div>
+                        <div className="gload">{galleryMine ? <><Pencil /> Edit</> : <><Upload /> Load</>}</div>
                       </div>
                     ))}
                   </div>
@@ -1511,10 +1570,12 @@ export default function HexMapEditor() {
         <div className="overlay" onMouseDown={e => { if (e.target === e.currentTarget) setSubmitOpen(false); }}>
           <div className="modal" role="dialog" aria-modal="true">
             <div className="modal-head">
-              <div className="m-ico"><Send /></div>
+              <div className="m-ico">{editingId ? <Pencil /> : <Send />}</div>
               <div>
-                <h2>Submit Map</h2>
-                <div className="m-sub">Send {subName || '—'} to wtd-analytics</div>
+                <h2>{editingId ? 'Update Map' : 'Submit Map'}</h2>
+                <div className="m-sub">
+                  {editingId ? `Save changes to ${subName || '—'}` : `Send ${subName || '—'} to wtd-analytics`}
+                </div>
               </div>
               <button className="icon-btn" onClick={() => setSubmitOpen(false)}><X /></button>
             </div>
@@ -1538,10 +1599,15 @@ export default function HexMapEditor() {
                   <ChevronDown />
                 </div>
               </div>
-              <div>
-                <span className="label">Submitted By</span>
-                <input className="m-input" value={subBy} placeholder="Your nickname" onChange={e => setSubBy(e.target.value)} />
-              </div>
+              {!session && !editingId && (
+                <div>
+                  <span className="label">Submitted By</span>
+                  <input className="m-input" value={subBy} placeholder="Your nickname" onChange={e => setSubBy(e.target.value)} />
+                </div>
+              )}
+              {session && (
+                <div className="m-owner">{editingId ? 'Editing as' : 'Submitting as'} <b>{session.name}</b> (Steam){!editingId && ' — you can edit this map later from “My Maps”.'}</div>
+              )}
               <div>
                 <span className="label">Patch Notes</span>
                 <textarea className="m-input m-area" value={subNotes} placeholder="What changed in this revision…" onChange={e => setSubNotes(e.target.value)} />
@@ -1551,7 +1617,10 @@ export default function HexMapEditor() {
               {subMsg && <span className={`m-msg${subStatus === 'ok' ? ' ok' : subStatus === 'error' ? ' err' : ''}`}>{subMsg}</span>}
               <button className="btn ghost" onClick={() => setSubmitOpen(false)}>Cancel</button>
               <button className={`btn primary${subStatus === 'ok' ? ' ok' : ''}`} onClick={handleSubmit} disabled={subStatus === 'sending'}>
-                <Send /> {subStatus === 'sending' ? 'Sending…' : subStatus === 'ok' ? 'Submitted' : 'Submit Map'}
+                {editingId ? <Pencil /> : <Send />}{' '}
+                {editingId
+                  ? (subStatus === 'sending' ? 'Saving…' : subStatus === 'ok' ? 'Saved' : 'Save Changes')
+                  : (subStatus === 'sending' ? 'Sending…' : subStatus === 'ok' ? 'Submitted' : 'Submit Map')}
               </button>
             </div>
           </div>
