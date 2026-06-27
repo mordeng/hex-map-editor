@@ -41,6 +41,17 @@ export interface MapData {
   spawnPoints?: SpawnPoint[];
   worldTree?: { q: number; r: number }; // Legacy single tree (backward compatibility)
   worldTrees?: WorldTree[]; // Multiple trees for multi-lane mode
+
+  // ── Optional embedded map metadata ────────────────────────────────────────
+  // Consumed by the Unity drop-in map loader (MapSelectionManager.DiscoverMapsFromDisk).
+  // All optional — older maps without them still load. Authored via the "Map Details"
+  // inspector panel; preserved on load/export (getExportData spreads ...data).
+  mapId?: string;            // Unique id; Unity falls back to the file name when empty
+  displayName?: string;      // Menu label; falls back to a prettified file name
+  difficulty?: number;       // 1-5; omitted → Unity estimates from spawn-point count
+  modId?: string;            // Tower/enemy/wave mod to load; empty = default
+  previewImage?: string;     // Optional sibling image filename (e.g. "frostpeak.png")
+  environmentScene?: string; // Additive biome scene name (Cinderheart / Verdant Veil / Miremaw)
 }
 
 // Painterly terrain palette (top / fill / bottom for vertical gradient)
@@ -489,6 +500,21 @@ export default function HexMapEditor() {
     a.href = url; a.download = lastFileName.current; a.click();
     URL.revokeObjectURL(url);
   };
+
+  // ---- map metadata ---------------------------------------------------------
+  // Sets an optional top-level metadata field on `data`. Empty/0 values are
+  // deleted rather than stored so the exported JSON stays clean and a re-saved
+  // old map doesn't gain empty-string fields (keeps it byte-minimal + backward
+  // compatible). These ride along on every export via getExportData's {...data}.
+  const updateMeta = useCallback(<K extends keyof MapData>(k: K, v: MapData[K] | undefined) => {
+    setData(prev => {
+      if (!prev) return prev;
+      const next: MapData = { ...prev };
+      if (v === undefined || v === '' || v === 0) delete next[k];
+      else next[k] = v;
+      return next;
+    });
+  }, []);
 
   // ---- mutations ------------------------------------------------------------
   const updateHex = <K extends keyof Hex>(k: K, v: Hex[K]) => {
@@ -1105,7 +1131,10 @@ export default function HexMapEditor() {
 
   const openSubmit = () => {
     if (!data) return;
-    setSubName(fileName.replace(/\.[^.]+$/, '').toUpperCase());
+    // Prefill from the map's own metadata so re-submitting a loaded map keeps its
+    // identity, falling back to the file name when the map predates these fields.
+    setSubName(data.displayName?.trim() || fileName.replace(/\.[^.]+$/, '').toUpperCase());
+    if (data.environmentScene && BIOMES.includes(data.environmentScene)) setSubBiome(data.environmentScene);
     setSubStatus('idle');
     setSubMsg('');
     setSubmitOpen(true);
@@ -1114,13 +1143,32 @@ export default function HexMapEditor() {
   const handleSubmit = async () => {
     const exportData = getExportData();
     if (!exportData) return;
+    const trimmedName = subName.trim();
+    if (!trimmedName) {
+      setSubStatus('error');
+      setSubMsg('Please enter a map name.');
+      return;
+    }
     setSubStatus('sending');
-    setSubMsg('Sending…');
+    setSubMsg('Checking name…');
     try {
+      // Reject duplicate names: a map with this name (case-insensitive) must not
+      // already exist in the gallery before we submit.
+      const listRes = await fetch(`${ANALYTICS_BASE}/api/maps`, { headers: { 'X-Submit-Token': SUBMIT_TOKEN } });
+      if (listRes.ok) {
+        const listData = await listRes.json().catch(() => ({}));
+        const existing: GalleryItem[] = Array.isArray(listData.maps) ? listData.maps : [];
+        if (existing.some(m => m.name?.trim().toLowerCase() === trimmedName.toLowerCase())) {
+          setSubStatus('error');
+          setSubMsg(`A map named “${trimmedName}” already exists. Choose a different name.`);
+          return;
+        }
+      }
+      setSubMsg('Sending…');
       const res = await fetch(`${ANALYTICS_BASE}/api/maps`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Submit-Token': SUBMIT_TOKEN },
-        body: JSON.stringify({ name: subName, biome: subBiome, submittedBy: subBy, notes: subNotes, map: exportData }),
+        body: JSON.stringify({ name: trimmedName, biome: subBiome, submittedBy: subBy, notes: subNotes, map: exportData }),
       });
       if (res.status === 401) {
         setSubStatus('error');
@@ -1302,6 +1350,55 @@ export default function HexMapEditor() {
               </div>
             </section>
           )}
+
+          {/* MAP DETAILS — identity + biome metadata embedded in the JSON.
+              Optional and backward compatible: blank fields are omitted from the
+              export, and older maps without them load fine. Authored here, carried
+              through load → edit → export/submit unchanged. */}
+          <section className="panel">
+            <div className="phead"><div className="ico"><Box /></div><h3>Map Details</h3></div>
+            <div className="pbody">
+              <span className="label">Display name</span>
+              <input className="m-input" value={data?.displayName ?? ''} placeholder="e.g. Frostpeak"
+                onChange={e => updateMeta('displayName', e.target.value)} />
+
+              <div className="gap" />
+              <span className="label">Map ID</span>
+              <input className="m-input" value={data?.mapId ?? ''} placeholder="defaults to file name"
+                onChange={e => updateMeta('mapId', e.target.value.trim())} />
+
+              <div className="gap" />
+              <span className="label">Biome scene</span>
+              <input className="m-input" list="env-scenes" value={data?.environmentScene ?? ''}
+                placeholder="(editor default scene)"
+                onChange={e => updateMeta('environmentScene', e.target.value.trim())} />
+              <datalist id="env-scenes">
+                <option value="Cinderheart" />
+                <option value="Verdant Veil" />
+                <option value="Miremaw" />
+              </datalist>
+
+              <div className="gap" />
+              <span className="label">Difficulty</span>
+              <div className="stepper">
+                <button onClick={() => updateMeta('difficulty', Math.max(0, (data?.difficulty ?? 0) - 1) || undefined)}>−</button>
+                <div className="val">{data?.difficulty ?? '—'}</div>
+                <button onClick={() => updateMeta('difficulty', Math.min(5, (data?.difficulty ?? 0) + 1))}>+</button>
+              </div>
+
+              <div className="gap" />
+              <span className="label">Mod ID</span>
+              <input className="m-input" value={data?.modId ?? ''} placeholder="(default ruleset)"
+                onChange={e => updateMeta('modId', e.target.value.trim())} />
+
+              <div className="gap" />
+              <span className="label">Preview image</span>
+              <input className="m-input" value={data?.previewImage ?? ''} placeholder="e.g. frostpeak.png"
+                onChange={e => updateMeta('previewImage', e.target.value.trim())} />
+
+              <div className="hint">Saved into the map JSON. All optional — leave blank and Unity derives sensible defaults.</div>
+            </div>
+          </section>
 
           {/* LEGEND */}
           <section className="panel">
