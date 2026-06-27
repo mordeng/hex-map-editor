@@ -8,6 +8,9 @@
 // on every request, so a tampered payload buys nothing.
 
 const STORAGE_KEY = 'wtd_session';
+// One-shot handoff slot: the in-progress map is stashed here just before the
+// Steam login redirect and restored (then cleared) when the editor reloads.
+const PENDING_MAP_KEY = 'wtd_pending_map';
 
 export interface SteamSession {
   steamId: string;
@@ -69,6 +72,29 @@ export function getSession(): SteamSession | null {
 export function authHeader(): Record<string, string> {
   const token = getToken();
   return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+/**
+ * Stash the current work before the login redirect so it survives the full-page
+ * round-trip to Steam. Overwrites any previous stash (only the latest matters).
+ */
+export function savePendingMap(snapshot: unknown): void {
+  try { localStorage.setItem(PENDING_MAP_KEY, JSON.stringify(snapshot)); } catch { /* quota/full */ }
+}
+
+/**
+ * Retrieve + remove the stashed map (one-shot). Returns null if none. Clearing
+ * on read is what guarantees a later normal reload never resurrects old work.
+ */
+export function takePendingMap<T = unknown>(): T | null {
+  try {
+    const raw = localStorage.getItem(PENDING_MAP_KEY);
+    if (!raw) return null;
+    localStorage.removeItem(PENDING_MAP_KEY);
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
 }
 
 /** Send the user to Steam, returning them to this exact editor page afterward. */

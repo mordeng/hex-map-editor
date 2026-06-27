@@ -11,8 +11,11 @@ import {
 } from 'lucide-react';
 import {
   captureTokenFromHash, getSession, authHeader, login as steamLogin, logout as steamLogout,
-  type SteamSession,
+  savePendingMap, takePendingMap, type SteamSession,
 } from '@/lib/session';
+
+// Shape of the in-progress work stashed across the Steam login redirect.
+interface PendingMap { map: MapData; fileName: string; editingId: string | null }
 
 // wtd-analytics map-submission endpoint (override if the deployed domain differs)
 // wtd-analytics base URL — override at build time with NEXT_PUBLIC_WTD_ANALYTICS_BASE.
@@ -388,6 +391,15 @@ export default function HexMapEditor() {
       .then(res => res.json())
       .then((parsed: MapData) => applyLoadedMap(parsed, 'cinderheart_v2.json'))
       .catch(err => console.error('Failed to load default map:', err));
+
+    // Restore work stashed right before a Steam login redirect. This wins over
+    // the default / ?load map so signing in never discards in-progress edits.
+    const pending = takePendingMap<PendingMap>();
+    if (pending?.map) {
+      applyLoadedMap(pending.map, pending.fileName);
+      setEditingId(pending.editingId ?? null); // after applyLoadedMap, which resets it
+      return;
+    }
 
     // ?load=<url> — open a specific map (e.g. a submitted map's Blob URL).
     const loadUrl = new URLSearchParams(window.location.search).get('load');
@@ -1232,7 +1244,12 @@ export default function HexMapEditor() {
     }
   };
 
-  const handleLogin = () => steamLogin(ANALYTICS_BASE);
+  const handleLogin = () => {
+    // Persist the current map so the full-page Steam round-trip doesn't wipe it.
+    const exportData = getExportData();
+    if (exportData) savePendingMap({ map: exportData, fileName, editingId } satisfies PendingMap);
+    steamLogin(ANALYTICS_BASE);
+  };
   const handleLogout = () => { steamLogout(); setSession(null); setEditingId(null); };
   const cycleSelectedTerrain = () => {
     if (!selected) return;
